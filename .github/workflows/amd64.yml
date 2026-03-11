@@ -5,7 +5,11 @@ on:
       docker_images:
         description: '请填写docker镜像名称 多个用英文逗号分开'
         required: true
-        default: 'alpine:latest'  # 设置默认的 Docker 镜像列表
+        default: 'alpine:latest'
+
+# 强制使用 Node.js 24 消除警告
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   pull_and_package:
@@ -15,30 +19,43 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Clean up Docker to free space
+    - name: Maximize Disk Space
       run: |
-          docker system prune -a -f
-          docker volume prune -f
+        # 深度清理预装软件，为大镜像腾出空间（约可多出 20GB+）
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /opt/ghc
+        docker system prune -a -f
 
     - name: Pull Docker Images and Package
       run: |
-        images="${{ github.event.inputs.docker_images }}"
+        # 处理输入：去除空格并按逗号分割
+        images=$(echo "${{ github.event.inputs.docker_images }}" | tr -d ' ')
         IFS=',' read -r -a image_array <<< "$images"
+        
         for image in "${image_array[@]}"; do
+          echo "正在处理镜像: $image"
+          # 强制拉取 x86-64 架构
           docker pull "${image}" --platform "linux/amd64"
-          docker save "${image}" -o "${image//\//_}-amd64.tar"
+          
+          # 优化文件名：将 / 和 : 替换为下划线，确保各种系统下都能正常解压
+          safe_name=$(echo "${image}" | sed 's/[\/:]/_/g')
+          docker save "${image}" -o "${safe_name}-amd64.tar"
+          echo "已保存: ${safe_name}-amd64.tar"
         done
 
-    - name: Compress the TAR files
-      run: tar -czf x86-64-images.tar.gz *-amd64.tar
+    - name: Compress all TAR files
+      run: |
+        # 将所有 tar 包压缩成一个 gz 文件
+        tar -czf x86-64-images-bundle.tar.gz *-amd64.tar
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: docker-images-tar
-        path: x86-64-images.tar.gz
-        retention-days: 3  # 将保留天数设置为 1 天 最多可设置90天
+        name: docker-offline-package  # 下载时的压缩包名称
+        path: x86-64-images-bundle.tar.gz
+        retention-days: 3 # 将保留天数设置为 1 天 最多可设置90天
 
-    - name: Clean up intermediate files
-      run: |
-        rm *-amd64.tar
+    - name: Clean up
+      if: always()
+      run: rm -f *.tar *.tar.gz
