@@ -7,7 +7,7 @@ on:
         required: true
         default: 'alpine:latest'
 
-# 强制使用 Node.js 24 消除警告
+# 强制使用 Node.js 24 消除旧版弃用错误
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -52,9 +52,9 @@ jobs:
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: docker-offline-package  # 下载时的压缩包名称
+        name: docker-offline-package
         path: x86-64-images-bundle.tar.gz
-        retention-days: 3 # 将保留天数设置为 1 天 最多可设置90天
+        retention-days: 3
 
     - name: Clean up
       if: always()
