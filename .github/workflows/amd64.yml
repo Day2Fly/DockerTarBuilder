@@ -1,61 +1,139 @@
 name: x86-64 Pull and Save Docker Image
+
 on:
   workflow_dispatch:
     inputs:
       docker_images:
-        description: '请填写docker镜像名称 多个用英文逗号分开'
+        description: '请填写docker镜像名称 多个英文逗号分开'
         required: true
         default: 'alpine:latest'
 
-# 强制使用 Node.js 24 消除旧版弃用错误
+
+# GitHub Actions Node.js 24 兼容
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+
 jobs:
+
   pull_and_package:
+
     runs-on: ubuntu-latest
 
+
     steps:
+
     - name: Checkout repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v5
+
 
     - name: Maximize Disk Space
       run: |
-        # 深度清理预装软件，为大镜像腾出空间（约可多出 20GB+）
-        sudo rm -rf /usr/share/dotnet
-        sudo rm -rf /usr/local/lib/android
-        sudo rm -rf /opt/ghc
-        docker system prune -a -f
+        echo "清理 GitHub Runner 空间..."
+
+        sudo rm -rf /usr/share/dotnet || true
+        sudo rm -rf /usr/local/lib/android || true
+        sudo rm -rf /opt/ghc || true
+
+        docker system prune -af
+
+        df -h
+
+
 
     - name: Pull Docker Images and Package
+      shell: bash
       run: |
-        # 处理输入：去除空格并按逗号分割
-        images=$(echo "${{ github.event.inputs.docker_images }}" | tr -d ' ')
-        IFS=',' read -r -a image_array <<< "$images"
-        
-        for image in "${image_array[@]}"; do
-          echo "正在处理镜像: $image"
-          # 强制拉取 x86-64 架构
-          docker pull "${image}" --platform "linux/amd64"
-          
-          # 优化文件名：将 / 和 : 替换为下划线，确保各种系统下都能正常解压
-          safe_name=$(echo "${image}" | sed 's/[\/:]/_/g')
-          docker save "${image}" -o "${safe_name}-amd64.tar"
-          echo "已保存: ${safe_name}-amd64.tar"
+
+        set -e
+
+
+        images="${{ github.event.inputs.docker_images }}"
+
+        # 删除空格
+        images=$(echo "$images" | tr -d ' ')
+
+
+        IFS=',' read -ra image_array <<< "$images"
+
+
+        for image in "${image_array[@]}"
+        do
+
+          echo "=============================="
+          echo "处理镜像:"
+          echo "$image"
+          echo "=============================="
+
+
+          # 强制 amd64
+          docker pull \
+            --platform linux/amd64 \
+            "$image"
+
+
+          # 文件名安全转换
+          safe_name=$(echo "$image" | sed 's#[/:]#_#g')
+
+
+          docker save \
+            "$image" \
+            -o "${safe_name}-amd64.tar"
+
+
+          echo "完成:"
+          echo "${safe_name}-amd64.tar"
+
+
         done
 
-    - name: Compress all TAR files
+
+
+    - name: Compress TAR files
+      shell: bash
       run: |
-        # 将所有 tar 包压缩成一个 gz 文件
-        tar -czf x86-64-images-bundle.tar.gz *-amd64.tar
+
+        set -e
+
+
+        files=$(ls *-amd64.tar 2>/dev/null || true)
+
+
+        if [ -z "$files" ]; then
+          echo "没有找到tar文件"
+          exit 1
+        fi
+
+
+        echo "开始压缩:"
+        echo "$files"
+
+
+        tar -czf \
+          x86-64-images-bundle.tar.gz \
+          $files
+
+
+
+        ls -lh *.tar.gz
+
+
 
     - name: Upload artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
+
         name: docker-offline-package
+
         path: x86-64-images-bundle.tar.gz
+
         retention-days: 3
+
+
 
     - name: Clean up
       if: always()
-      run: rm -f *.tar *.tar.gz
+      run: |
+
+        rm -f *.tar || true
+        rm -f *.tar.gz || true
