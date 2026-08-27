@@ -12,10 +12,6 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: docker-amd64-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   pull_and_package:
     name: Pull AMD64 Images
