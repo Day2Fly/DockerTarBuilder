@@ -1,40 +1,207 @@
 name: ARM64 Pull and Save Docker Image
 
+
 on:
+
   workflow_dispatch:
+
     inputs:
+
       docker_images:
-        description: '请填写docker镜像名称 多个用英文逗号分开'
+
+        description: '请输入 Docker 镜像名称，多个镜像使用英文逗号分隔'
+
         required: true
-        default: 'alpine:latest,ubuntu:latest'  # 设置默认的 Docker 镜像列表
+
+        default: 'alpine:latest,ubuntu:latest'
+
+        type: string
+
+
+
+permissions:
+
+  contents: read
+
+
+
+concurrency:
+
+  group: docker-arm64-${{ github.ref }}
+
+  cancel-in-progress: true
+
+
 
 jobs:
+
+
   pull_and_package:
-    runs-on: ubuntu-latest
+
+
+    name: Pull ARM64 Images
+
+
+    runs-on: ubuntu-22.04
+
+
+    timeout-minutes: 45
+
+
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+
+
+    - name: Free Disk Space
+
+      run: |
+
+        sudo rm -rf /usr/local/lib/android
+
+        sudo rm -rf /usr/share/dotnet
+
+        df -h
+
+
+
+    - name: Install zstd
+
+      run: |
+
+        sudo apt update
+
+        sudo apt install -y zstd
+
+
 
     - name: Pull Docker Images and Package
+
+      shell: bash
+
       run: |
+
+
+        mkdir -p output
+
+
         images="${{ github.event.inputs.docker_images }}"
-        IFS=',' read -r -a image_array <<< "$images"
-        for image in "${image_array[@]}"; do
-          docker pull "${image}" --platform "linux/arm64"
-          docker save "${image}" -o "${image//\//_}-arm64.tar"
+
+
+        IFS=',' read -ra image_array <<< "$images"
+
+
+        for image in "${image_array[@]}"
+
+        do
+
+          image=$(echo "$image" | xargs)
+
+
+          echo "=============================="
+
+          echo "Pulling: $image"
+
+          echo "=============================="
+
+
+          success=false
+
+
+          for retry in {1..5}
+
+          do
+
+            docker pull "$image" --platform linux/arm64 && success=true && break
+
+
+            echo "Pull failed retry ${retry}/5"
+
+            sleep 20
+
+          done
+
+
+
+          if [ "$success" != true ]; then
+
+            echo "Failed pulling $image"
+
+            exit 1
+
+          fi
+
+
+
+          filename=$(echo "$image" | sed 's#[/:]#_#g')
+
+
+          docker save "$image" \
+
+          -o "output/${filename}-arm64.tar"
+
+
         done
 
-    - name: Compress the TAR files
-      run: tar -czf arm64-images.tar.gz *-arm64.tar
 
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: docker-images-tar
-        path: arm64-images.tar.gz
-        retention-days: 1  # 将保留天数设置为 1 天 最多可设置90天
 
-    - name: Clean up intermediate files
+    - name: Compress Images
+
+
       run: |
-        rm *-arm64.tar
+
+
+        cd output
+
+
+        tar_files=$(ls *-arm64.tar)
+
+
+        tar -cf arm64-images.tar $tar_files
+
+
+        zstd -19 arm64-images.tar \
+
+        -o arm64-images.tar.zst
+
+
+
+        sha256sum arm64-images.tar.zst \
+
+        > arm64-images.sha256
+
+
+
+        rm -f *-arm64.tar arm64-images.tar
+
+
+
+    - name: Upload Artifact
+
+
+      uses: actions/upload-artifact@v4
+
+
+      with:
+
+
+        name: docker-images-arm64
+
+
+        path: |
+
+          output/arm64-images.tar.zst
+
+          output/arm64-images.sha256
+
+
+        retention-days: 7
+
+
+
+    - name: Clean Workspace
+
+
+      run: |
+
+
+        rm -rf output
