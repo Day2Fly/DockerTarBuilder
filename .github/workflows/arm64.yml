@@ -24,15 +24,6 @@ permissions:
   contents: read
 
 
-
-concurrency:
-
-  group: docker-arm64-${{ github.ref }}
-
-  cancel-in-progress: true
-
-
-
 jobs:
 
 
