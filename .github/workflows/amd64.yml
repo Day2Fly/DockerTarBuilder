@@ -15,7 +15,7 @@ permissions:
 jobs:
 
   # ==========================================================
-  # 1. 准备镜像列表
+  # 1. 准备 Matrix
   # ==========================================================
   prepare:
     name: Prepare Image List
@@ -34,7 +34,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "原始镜像列表："
+          echo "========================================"
+          echo "原始镜像列表"
+          echo "========================================"
           echo "$DOCKER_IMAGES"
 
           images_json=$(
@@ -48,7 +50,7 @@ jobs:
           image_count=$(echo "$images_json" | jq 'length')
 
           if [ "$image_count" -eq 0 ]; then
-            echo "错误：没有有效的 Docker 镜像。"
+            echo "❌ 没有有效的 Docker 镜像。"
             exit 1
           fi
 
@@ -63,10 +65,9 @@ jobs:
             '
           )
 
-          echo "========================================"
+          echo
           echo "镜像数量：$image_count"
-          echo "========================================"
-
+          echo
           echo "$matrix_json" | jq .
 
           echo "matrix=$matrix_json" >> "$GITHUB_OUTPUT"
@@ -82,6 +83,8 @@ jobs:
 
     strategy:
       fail-fast: false
+
+      # 同时最多运行 4 个镜像
       max-parallel: 4
 
       matrix:
@@ -93,6 +96,9 @@ jobs:
 
     steps:
 
+      # ------------------------------------------------------
+      # 清理磁盘
+      # ------------------------------------------------------
       - name: Free Disk Space
         shell: bash
         run: |
@@ -107,9 +113,13 @@ jobs:
           docker system prune -af || true
 
           echo
+          echo "当前磁盘："
           df -h
 
 
+      # ------------------------------------------------------
+      # Docker Hub 登录
+      # ------------------------------------------------------
       - name: Docker Login
         shell: bash
         env:
@@ -118,20 +128,23 @@ jobs:
         run: |
           if [ -n "$DOCKER_USERNAME" ] && [ -n "$DOCKER_PASSWORD" ]; then
 
-            echo "检测到 Docker Hub 登录凭据，开始登录..."
+            echo "检测到 Docker Hub 登录凭据"
 
             echo "$DOCKER_PASSWORD" |
-            docker login \
-              --username "$DOCKER_USERNAME" \
-              --password-stdin
+              docker login \
+                --username "$DOCKER_USERNAME" \
+                --password-stdin
 
           else
 
-            echo "未配置 Docker Hub 登录凭据，跳过登录。"
+            echo "未配置 Docker Hub 登录凭据，跳过登录"
 
           fi
 
 
+      # ------------------------------------------------------
+      # Pull + Save
+      # ------------------------------------------------------
       - name: Pull and Save Image
         shell: bash
         env:
@@ -142,29 +155,34 @@ jobs:
 
           PLATFORM="linux/amd64"
 
-          mkdir -p result
           mkdir -p output
+          mkdir -p result
 
           SAFE_NAME="$(echo "$IMAGE" | sed 's#[/:@]#_#g')"
 
           TAR_FILE="output/${INDEX}-${SAFE_NAME}-amd64.tar"
 
-          RESULT_FILE="result/${INDEX}-result.txt"
+          RESULT_FILE="result/result.txt"
 
-          LOG_FILE="result/${INDEX}-pull.log"
+          LOG_FILE="result/pull.log"
 
           pull_success=false
           final_reason=""
 
           echo "=================================================="
           echo "镜像：$IMAGE"
-          echo "架构：$PLATFORM"
+          echo "平台：$PLATFORM"
           echo "=================================================="
+
+
+          # ==================================================
+          # Docker Pull
+          # ==================================================
 
           for retry in 1 2 3 4 5; do
 
             echo
-            echo "拉取尝试 ${retry}/5"
+            echo "第 ${retry}/5 次拉取：$IMAGE"
 
             : > "$LOG_FILE"
 
@@ -180,37 +198,40 @@ jobs:
 
             set -e
 
+
             if [ "$pull_status" -eq 0 ]; then
 
-              echo
-              echo "✅ 镜像拉取成功"
+              echo "✅ 拉取成功"
 
               pull_success=true
               break
 
             fi
 
-            echo
-            echo "❌ docker pull 失败，退出码：$pull_status"
 
-            # ==================================================
-            # 不可重试错误
-            # ==================================================
+            echo "❌ Pull 失败，退出码：$pull_status"
+
+
+            # =================================================
+            # 明确不可重试
+            # =================================================
 
             if grep -Eqi \
               'manifest unknown|manifest.*unknown|no matching manifest|does not have a matching manifest|pull access denied|access denied|unauthorized|authentication required|insufficient_scope|repository does not exist|repository.*not found|not found: manifest|invalid reference format|reference does not match' \
               "$LOG_FILE"; then
 
-              final_reason="不可重试错误：镜像不存在、Tag 不存在、架构不存在或无权限"
+              final_reason="不可重试：镜像/Tag/架构不存在或无权限"
 
               echo "⚠️ $final_reason"
 
               break
+
             fi
 
-            # ==================================================
-            # 可重试错误
-            # ==================================================
+
+            # =================================================
+            # 网络/临时错误
+            # =================================================
 
             if grep -Eqi \
               '429|too many requests|timeout|timed out|TLS handshake timeout|connection reset|connection refused|connection timed out|unexpected EOF|EOF|temporary failure|temporary error|network is unreachable|no route to host|502|503|504|bad gateway|service unavailable|server error|i/o timeout|context deadline exceeded|rate limit' \
@@ -220,14 +241,14 @@ jobs:
 
               if [ "$retry" -lt 5 ]; then
 
-                echo "🌐 检测到网络/临时错误"
+                echo "🌐 网络/临时错误"
                 echo "20 秒后重试..."
 
                 sleep 20
 
               else
 
-                echo "❌ 网络错误连续失败 5 次"
+                echo "❌ 已重试 5 次"
 
               fi
 
@@ -244,7 +265,7 @@ jobs:
 
               else
 
-                echo "❌ 未知错误连续失败 5 次"
+                echo "❌ 已重试 5 次"
 
               fi
 
@@ -254,17 +275,13 @@ jobs:
 
 
           # ==================================================
-          # 拉取失败
+          # Pull 最终失败
           # ==================================================
 
           if [ "$pull_success" != true ]; then
 
             echo
-            echo "=================================================="
-            echo "❌ 镜像失败"
-            echo "镜像：$IMAGE"
-            echo "原因：$final_reason"
-            echo "=================================================="
+            echo "❌ 镜像失败：$IMAGE"
 
             {
               echo "STATUS=failed"
@@ -282,12 +299,12 @@ jobs:
           # ==================================================
 
           echo
-          echo "开始保存 Docker TAR："
-          echo "$TAR_FILE"
+          echo "开始 docker save..."
 
-          if docker save "$IMAGE" -o "$TAR_FILE"; then
+          if docker save \
+            "$IMAGE" \
+            -o "$TAR_FILE"; then
 
-            echo
             echo "✅ Docker save 成功"
 
             {
@@ -299,7 +316,6 @@ jobs:
 
           else
 
-            echo
             echo "❌ Docker save 失败"
 
             rm -f "$TAR_FILE"
@@ -315,34 +331,40 @@ jobs:
 
 
       # ======================================================
-      # 3. 上传成功镜像
+      # 3. 成功 TAR：直接上传
+      #
+      # archive:false
+      # compression-level:0
+      #
+      # 不再让 GitHub Artifact 对 Docker TAR 做 ZIP
       # ======================================================
-      - name: Upload Successful Image
+      - name: Upload Docker TAR
         if: hashFiles('output/*.tar') != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: docker-success-${{ matrix.index }}
           path: output/*.tar
+          archive: false
+          compression-level: 0
           if-no-files-found: error
           retention-days: 7
 
 
       # ======================================================
-      # 4. 上传处理结果
+      # 4. 结果文件
       # ======================================================
       - name: Upload Result
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: docker-result-${{ matrix.index }}
-          path: result/
+          name: result-${{ matrix.index }}
+          path: result/result.txt
+          compression-level: 0
           if-no-files-found: error
           retention-days: 7
 
 
       - name: Clean Workspace
         if: always()
-        shell: bash
         run: |
           rm -rf output
           rm -rf result
@@ -351,7 +373,7 @@ jobs:
 
 
   # ==========================================================
-  # 5. 汇总并打包
+  # 5. 最终汇总
   # ==========================================================
   package:
     name: Package AMD64 Images
@@ -368,42 +390,45 @@ jobs:
 
     steps:
 
+      # ------------------------------------------------------
+      # 安装 zstd
+      # ------------------------------------------------------
       - name: Install zstd
         shell: bash
         run: |
           set -e
 
           sudo apt-get update
-          sudo apt-get install -y zstd jq
+          sudo apt-get install -y zstd
 
 
-      # ======================================================
-      # 下载所有成功镜像
-      # ======================================================
-      - name: Download Successful Images
-        uses: actions/download-artifact@v4
+      # ------------------------------------------------------
+      # 下载所有成功 Docker TAR
+      # ------------------------------------------------------
+      - name: Download Docker TAR Files
+        uses: actions/download-artifact@v7
         continue-on-error: true
         with:
-          pattern: docker-success-*
+          pattern: '*-amd64.tar'
           path: success-images
           merge-multiple: true
 
 
-      # ======================================================
-      # 下载所有处理结果
-      # ======================================================
-      - name: Download Results
-        uses: actions/download-artifact@v4
+      # ------------------------------------------------------
+      # 下载结果文件
+      # ------------------------------------------------------
+      - name: Download Result Files
+        uses: actions/download-artifact@v7
         continue-on-error: true
         with:
-          pattern: docker-result-*
+          pattern: result-*
           path: results
           merge-multiple: true
 
 
-      # ======================================================
-      # 汇总结果并生成压缩包
-      # ======================================================
+      # ------------------------------------------------------
+      # 创建最终压缩包
+      # ------------------------------------------------------
       - name: Package Images
         shell: bash
         run: |
@@ -417,70 +442,59 @@ jobs:
           : > "$SUCCESS_FILE"
           : > "$FAILED_FILE"
 
-          echo "========================================"
-          echo "汇总镜像处理结果"
-          echo "========================================"
-
-
-          # ==================================================
-          # 汇总成功/失败结果
-          # ==================================================
-
           success_count=0
           failed_count=0
+
+
+          echo "========================================"
+          echo "汇总处理结果"
+          echo "========================================"
+
+
+          # ==================================================
+          # 读取结果
+          # ==================================================
 
           shopt -s nullglob
 
           result_files=(results/*.txt)
 
-          if [ "${#result_files[@]}" -gt 0 ]; then
+          for file in "${result_files[@]}"; do
 
-            for file in "${result_files[@]}"; do
+            status="$(grep '^STATUS=' "$file" | cut -d= -f2- || true)"
+            image="$(grep '^IMAGE=' "$file" | cut -d= -f2- || true)"
+            platform="$(grep '^PLATFORM=' "$file" | cut -d= -f2- || true)"
+            reason="$(grep '^REASON=' "$file" | cut -d= -f2- || true)"
 
-              echo
-              echo "读取结果：$file"
+            if [ "$status" = "success" ]; then
 
-              cat "$file"
+              echo "$image | $platform | success" \
+                >> "$SUCCESS_FILE"
 
-              echo
+              success_count=$((success_count + 1))
 
-              status=$(grep '^STATUS=' "$file" | cut -d= -f2- || true)
-              image=$(grep '^IMAGE=' "$file" | cut -d= -f2- || true)
-              platform=$(grep '^PLATFORM=' "$file" | cut -d= -f2- || true)
-              reason=$(grep '^REASON=' "$file" | cut -d= -f2- || true)
+            else
 
-              if [ "$status" = "success" ]; then
+              echo "$image | $platform | $reason" \
+                >> "$FAILED_FILE"
 
-                echo "$image | $platform | success" \
-                  >> "$SUCCESS_FILE"
+              failed_count=$((failed_count + 1))
 
-                success_count=$((success_count + 1))
+            fi
 
-              else
-
-                echo "$image | $platform | $reason" \
-                  >> "$FAILED_FILE"
-
-                failed_count=$((failed_count + 1))
-
-              fi
-
-            done
-
-          fi
+          done
 
 
           # ==================================================
           # 查找成功 TAR
           # ==================================================
 
-          tar_files=(success-images/*.tar)
+          tar_files=(success-images/*-amd64.tar)
 
 
           if [ "${#tar_files[@]}" -eq 0 ]; then
 
-            echo
-            echo "⚠️ 没有任何镜像成功。"
+            echo "⚠️ 没有成功镜像"
 
             echo "没有成功的 Docker 镜像。" \
               > output/package_status.txt
@@ -489,26 +503,49 @@ jobs:
 
             echo
             echo "========================================"
-            echo "成功镜像 TAR："
+            echo "成功 Docker TAR"
             echo "========================================"
 
             printf '%s\n' "${tar_files[@]}"
 
 
+            # ------------------------------------------------
+            # 创建无压缩外层 TAR
+            # ------------------------------------------------
+
             echo
             echo "创建 amd64-images.tar..."
 
-            tar -cf output/amd64-images.tar \
-              "${tar_files[@]}"
+            tar -cf \
+              output/amd64-images.tar \
+              -C success-images \
+              "${tar_files[@]#success-images/}"
 
+
+            # ------------------------------------------------
+            # Zstandard
+            #
+            # -T0 = 使用所有 CPU
+            # -3  = 高速模式
+            #
+            # Docker layer 很多本身就是压缩数据，
+            # 没必要使用 zstd -19。
+            # ------------------------------------------------
 
             echo
-            echo "使用 Zstandard -19 压缩..."
+            echo "开始 Zstandard 高速压缩..."
 
-            zstd -19 --rm \
+            zstd \
+              -T0 \
+              -3 \
+              --rm \
               output/amd64-images.tar \
               -o output/amd64-images.tar.zst
 
+
+            # ------------------------------------------------
+            # SHA256
+            # ------------------------------------------------
 
             echo
             echo "生成 SHA256..."
@@ -524,38 +561,43 @@ jobs:
           fi
 
 
+          # ==================================================
+          # 最终输出
+          # ==================================================
+
           echo
           echo "========================================"
-          echo "最终统计"
-          echo "========================================"
-          echo "成功：$success_count"
-          echo "失败：$failed_count"
+          echo "AMD64 最终统计"
           echo "========================================"
 
+          echo "成功镜像：$success_count"
+          echo "失败镜像：$failed_count"
 
           echo
           echo "========== SUCCESS =========="
 
           cat "$SUCCESS_FILE" || true
 
-
           echo
           echo "========== FAILED =========="
 
           cat "$FAILED_FILE" || true
 
-
           echo
-          echo "========== FILES =========="
+          echo "========== FINAL FILES =========="
 
-          find output -maxdepth 1 -type f -printf '%f\n' | sort
+          find output \
+            -maxdepth 1 \
+            -type f \
+            -printf '%f  %s bytes\n' \
+            | sort
 
 
       # ======================================================
-      # 6. 上传最终结果
+      # 6. 最终 Artifact
       # ======================================================
       - name: Upload Final Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: docker-images-amd64
           path: |
@@ -564,8 +606,9 @@ jobs:
             output/success.txt
             output/failed.txt
             output/package_status.txt
-          if-no-files-found: warn
+          compression-level: 0
           retention-days: 7
+          if-no-files-found: warn
 
 
       - name: Clean Package Workspace
