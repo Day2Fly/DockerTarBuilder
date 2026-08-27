@@ -8,12 +8,12 @@ permissions:
 
 jobs:
   cleanup:
-    name: Delete Failed Workflow Runs
+    name: Delete Old Workflow Runs
     runs-on: ubuntu-22.04
     timeout-minutes: 15
 
     steps:
-      - name: Cleanup failed workflow runs
+      - name: Cleanup old workflow runs
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -23,69 +23,122 @@ jobs:
           REPO="${{ github.repository }}"
           API="https://api.github.com/repos/${REPO}/actions/runs"
 
+          CURRENT_RUN_ID="${{ github.run_id }}"
+          CURRENT_WORKFLOW_NAME="${{ github.workflow }}"
+
           deleted=0
           failed=0
+          scanned=0
           page=1
-          total_found=0
 
           echo "========================================"
-          echo "开始扫描失败的 Workflow Runs"
-          echo "仓库: ${REPO}"
+          echo "DockerTarBuilder Workflow 清理器"
+          echo "仓库：${REPO}"
+          echo "当前 Run ID：${CURRENT_RUN_ID}"
+          echo "当前 Workflow：${CURRENT_WORKFLOW_NAME}"
           echo "========================================"
 
           while true; do
 
             echo
-            echo "正在读取第 ${page} 页..."
+            echo "扫描第 ${page} 页..."
 
             response=$(curl -fsSL \
               -H "Accept: application/vnd.github+json" \
               -H "Authorization: Bearer ${GH_TOKEN}" \
               -H "X-GitHub-Api-Version: 2026-03-10" \
-              "${API}?status=failure&per_page=100&page=${page}")
+              "${API}?per_page=100&page=${page}")
 
             count=$(echo "$response" | jq '.workflow_runs | length')
 
             if [ "$count" -eq 0 ]; then
-              echo "没有更多失败记录。"
+              echo "没有更多 Workflow Run。"
               break
             fi
 
-            echo "本页找到 ${count} 个失败记录。"
+            scanned=$((scanned + count))
 
-            total_found=$((total_found + count))
-
-            while IFS=$'\t' read -r run_id run_number name created_at; do
+            while IFS=$'\t' read -r \
+              run_id \
+              run_number \
+              name \
+              status \
+              conclusion \
+              created_at
+            do
 
               echo
               echo "----------------------------------------"
-              echo "Workflow : ${name}"
-              echo "Run      : #${run_number}"
-              echo "Run ID   : ${run_id}"
-              echo "Created  : ${created_at}"
+              echo "Workflow  : ${name}"
+              echo "Run       : #${run_number}"
+              echo "Run ID    : ${run_id}"
+              echo "Status    : ${status}"
+              echo "Conclusion: ${conclusion}"
+              echo "Created   : ${created_at}"
               echo "----------------------------------------"
 
-              http_code=$(curl -sS \
-                -o /tmp/delete_response.json \
-                -w "%{http_code}" \
-                -L \
-                -X DELETE \
-                -H "Accept: application/vnd.github+json" \
-                -H "Authorization: Bearer ${GH_TOKEN}" \
-                -H "X-GitHub-Api-Version: 2026-03-10" \
-                "${API}/${run_id}")
+              # 绝对不能删除当前正在运行的 Cleanup Workflow
+              if [ "$run_id" = "$CURRENT_RUN_ID" ]; then
+                echo "⏭️ 跳过当前正在运行的 Cleanup Workflow"
+                continue
+              fi
 
-              if [ "$http_code" = "204" ]; then
-                echo "✅ 删除成功"
-                deleted=$((deleted + 1))
-              else
-                echo "❌ 删除失败，HTTP ${http_code}"
+              should_delete=false
 
-                if [ -s /tmp/delete_response.json ]; then
-                  cat /tmp/delete_response.json
+              # ------------------------------------------------
+              # 1. 删除所有已失败的 Workflow
+              # ------------------------------------------------
+              if [ "$conclusion" = "failure" ]; then
+                should_delete=true
+              fi
+
+              # ------------------------------------------------
+              # 2. 删除旧的 Cleanup Workflow Runs
+              #    只保留当前正在运行的这一份
+              # ------------------------------------------------
+              if [ "$name" = "$CURRENT_WORKFLOW_NAME" ] &&
+                 [ "$status" = "completed" ]; then
+                should_delete=true
+              fi
+
+              # ------------------------------------------------
+              # 3. 只处理已经 completed 的 Run
+              #    queued / in_progress / waiting 不删除
+              # ------------------------------------------------
+              if [ "$status" != "completed" ]; then
+                should_delete=false
+                echo "⏭️ Run 尚未完成，跳过删除"
+              fi
+
+              if [ "$should_delete" = true ]; then
+
+                echo "🗑️ 准备删除 Run ${run_id}"
+
+                http_code=$(curl -sS \
+                  -o /tmp/delete_response.json \
+                  -w "%{http_code}" \
+                  -L \
+                  -X DELETE \
+                  -H "Accept: application/vnd.github+json" \
+                  -H "Authorization: Bearer ${GH_TOKEN}" \
+                  -H "X-GitHub-Api-Version: 2026-03-10" \
+                  "${API}/${run_id}")
+
+                if [ "$http_code" = "204" ]; then
+                  echo "✅ 删除成功：${run_id}"
+                  deleted=$((deleted + 1))
+                else
+                  echo "❌ 删除失败：${run_id}，HTTP ${http_code}"
+
+                  if [ -s /tmp/delete_response.json ]; then
+                    cat /tmp/delete_response.json
+                  fi
+
+                  failed=$((failed + 1))
                 fi
 
-                failed=$((failed + 1))
+              else
+                echo "⏭️ 保留"
               fi
 
             done < <(
@@ -96,6 +149,8 @@ jobs:
                   .id,
                   .run_number,
                   .name,
+                  .status,
+                  (.conclusion // ""),
                   .created_at
                 ] |
                 @tsv
@@ -104,22 +159,23 @@ jobs:
 
             page=$((page + 1))
 
-            # GitHub 对 status 筛选的搜索结果最多返回 1000 条。
+            # 防止无限扫描
             if [ "$page" -gt 10 ]; then
               echo
-              echo "已达到 GitHub API 单次搜索最多 1000 条记录的限制。"
+              echo "已扫描最多 1000 个 Workflow Runs。"
               break
             fi
 
           done
 
+          rm -f /tmp/delete_response.json
+
           echo
           echo "========================================"
           echo "清理完成"
           echo "========================================"
-          echo "发现失败记录 : ${total_found}"
-          echo "删除成功      : ${deleted}"
-          echo "删除失败      : ${failed}"
+          echo "扫描 Run 数量 : ${scanned}"
+          echo "删除成功       : ${deleted}"
+          echo "删除失败       : ${failed}"
+          echo "当前 Run       : ${CURRENT_RUN_ID}"
           echo "========================================"
-
-          rm -f /tmp/delete_response.json
