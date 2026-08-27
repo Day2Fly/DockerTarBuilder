@@ -1,139 +1,180 @@
-name: x86-64 Pull and Save Docker Image
+name: Docker Pull Save amd64
+
 
 on:
+
   workflow_dispatch:
+
     inputs:
-      docker_images:
-        description: '请填写docker镜像名称 多个英文逗号分开'
+
+      image:
+
+        description: Docker Image
+
         required: true
-        default: 'alpine:latest'
+
+        type: string
 
 
-# GitHub Actions Node.js 24 兼容
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      tag:
+
+        description: Image Tag
+
+        required: false
+
+        default: latest
+
+        type: string
+
+
+
+permissions:
+
+  contents: write
+
+
+
+concurrency:
+
+  group: docker-amd64-${{ github.ref }}
+
+  cancel-in-progress: true
+
 
 
 jobs:
 
-  pull_and_package:
 
-    runs-on: ubuntu-latest
+  build:
+
+
+    name: Pull amd64 Image
+
+
+    runs-on: ubuntu-22.04
+
+
+    timeout-minutes: 45
 
 
     steps:
 
-    - name: Checkout repository
-      uses: actions/checkout@v5
 
+    - name: Free Disk
 
-    - name: Maximize Disk Space
       run: |
-        echo "清理 GitHub Runner 空间..."
 
-        sudo rm -rf /usr/share/dotnet || true
-        sudo rm -rf /usr/local/lib/android || true
-        sudo rm -rf /opt/ghc || true
+        sudo rm -rf /usr/local/lib/android
 
-        docker system prune -af
+        sudo rm -rf /usr/share/dotnet
 
         df -h
 
 
 
-    - name: Pull Docker Images and Package
-      shell: bash
+    - name: Install tools
+
       run: |
 
-        set -e
+        sudo apt update
+
+        sudo apt install -y zstd jq
 
 
-        images="${{ github.event.inputs.docker_images }}"
 
-        # 删除空格
-        images=$(echo "$images" | tr -d ' ')
+    - name: Docker Login
+
+      if: secrets.DOCKER_USERNAME != ''
+
+      run: |
+
+        echo "${{secrets.DOCKER_PASSWORD}}" |
+
+        docker login \
+
+        -u "${{secrets.DOCKER_USERNAME}}" \
+
+        --password-stdin
 
 
-        IFS=',' read -ra image_array <<< "$images"
+
+    - name: Pull Image
 
 
-        for image in "${image_array[@]}"
+      env:
+
+        IMAGE: ${{inputs.image}}
+
+        TAG: ${{inputs.tag}}
+
+
+      run: |
+
+
+        FULL=${IMAGE}:${TAG}
+
+
+        for i in 1 2 3 4 5
+
         do
 
-          echo "=============================="
-          echo "处理镜像:"
-          echo "$image"
-          echo "=============================="
+          docker pull --platform linux/amd64 $FULL && break
 
+          echo retry $i
 
-          # 强制 amd64
-          docker pull \
-            --platform linux/amd64 \
-            "$image"
-
-
-          # 文件名安全转换
-          safe_name=$(echo "$image" | sed 's#[/:]#_#g')
-
-
-          docker save \
-            "$image" \
-            -o "${safe_name}-amd64.tar"
-
-
-          echo "完成:"
-          echo "${safe_name}-amd64.tar"
-
+          sleep 20
 
         done
 
 
 
-    - name: Compress TAR files
-      shell: bash
+    - name: Save
+
+
       run: |
 
-        set -e
+
+        mkdir output
 
 
-        files=$(ls *-amd64.tar 2>/dev/null || true)
+        docker save \
 
+        ${{inputs.image}}:${{inputs.tag}} \
 
-        if [ -z "$files" ]; then
-          echo "没有找到tar文件"
-          exit 1
-        fi
-
-
-        echo "开始压缩:"
-        echo "$files"
-
-
-        tar -czf \
-          x86-64-images-bundle.tar.gz \
-          $files
+        -o output/image.tar
 
 
 
-        ls -lh *.tar.gz
+    - name: Compress
+
+
+      run: |
+
+
+        cd output
+
+
+        zstd -19 image.tar \
+
+        -o docker-amd64.tar.zst
+
+
+        sha256sum docker-amd64.tar.zst \
+
+        > docker-amd64.sha256
 
 
 
-    - name: Upload artifact
-      uses: actions/upload-artifact@v5
+    - name: Upload Artifact
+
+
+      uses: actions/upload-artifact@v4
+
+
       with:
 
-        name: docker-offline-package
 
-        path: x86-64-images-bundle.tar.gz
+        name: docker-amd64
 
-        retention-days: 3
+        path: output/docker-amd64.tar.zst
 
-
-
-    - name: Clean up
-      if: always()
-      run: |
-
-        rm -f *.tar || true
-        rm -f *.tar.gz || true
