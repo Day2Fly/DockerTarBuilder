@@ -1,0 +1,60 @@
+name: Cleanup Workflow Runs
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_ids:
+        description: '请输入要删除的 Run ID，多个用英文逗号分隔'
+        required: true
+        type: string
+
+permissions:
+  actions: write
+
+jobs:
+  cleanup:
+    name: Delete Workflow Runs
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Delete workflow runs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_IDS: ${{ inputs.run_ids }}
+        run: |
+          set -euo pipefail
+
+          IFS=',' read -ra IDS <<< "$RUN_IDS"
+
+          for run_id in "${IDS[@]}"; do
+            run_id="$(echo "$run_id" | xargs)"
+
+            if ! [[ "$run_id" =~ ^[0-9]+$ ]]; then
+              echo "无效的 Run ID：$run_id"
+              exit 1
+            fi
+
+            echo "========================================"
+            echo "正在删除 Workflow Run: $run_id"
+            echo "========================================"
+
+            response=$(curl -sS -w '\n%{http_code}' \
+              -L \
+              -X DELETE \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/runs/${run_id}")
+
+            http_code="$(echo "$response" | tail -n 1)"
+
+            if [ "$http_code" = "204" ]; then
+              echo "删除成功: $run_id"
+            else
+              echo "删除失败: $run_id"
+              echo "$response"
+              exit 1
+            fi
+          done
