@@ -1,90 +1,125 @@
-name: Cleanup Workflow Runs
+name: Cleanup Failed Workflow Runs
 
 on:
   workflow_dispatch:
-    inputs:
-      run_ids:
-        description: '请输入真实 Run ID，多个用英文逗号分隔'
-        required: true
-        type: string
 
 permissions:
   actions: write
 
 jobs:
   cleanup:
-    name: Delete Workflow Runs
+    name: Delete Failed Workflow Runs
     runs-on: ubuntu-22.04
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
-      - name: Delete workflow runs
+      - name: Cleanup failed workflow runs
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          RUN_IDS: ${{ inputs.run_ids }}
-
         run: |
           set -u
 
-          IFS=',' read -ra IDS <<< "$RUN_IDS"
+          REPO="${{ github.repository }}"
+          API="https://api.github.com/repos/${REPO}/actions/runs"
 
-          for run_id in "${IDS[@]}"; do
+          deleted=0
+          failed=0
+          page=1
+          total_found=0
 
-            run_id="$(echo "$run_id" | xargs)"
+          echo "========================================"
+          echo "开始扫描失败的 Workflow Runs"
+          echo "仓库: ${REPO}"
+          echo "========================================"
 
-            if ! [[ "$run_id" =~ ^[0-9]+$ ]]; then
-              echo "❌ 无效 Run ID: $run_id"
-              continue
+          while true; do
+
+            echo
+            echo "正在读取第 ${page} 页..."
+
+            response=$(curl -fsSL \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "${API}?status=failure&per_page=100&page=${page}")
+
+            count=$(echo "$response" | jq '.workflow_runs | length')
+
+            if [ "$count" -eq 0 ]; then
+              echo "没有更多失败记录。"
+              break
             fi
 
+            echo "本页找到 ${count} 个失败记录。"
 
-            echo "========================================"
-            echo "检查 Workflow Run: $run_id"
-            echo "========================================"
+            total_found=$((total_found + count))
 
+            while IFS=$'\t' read -r run_id run_number name created_at; do
 
-            check=$(curl -sS \
-              -H "Accept: application/vnd.github+json" \
-              -H "Authorization: Bearer $GH_TOKEN" \
-              -H "X-GitHub-Api-Version: 2026-03-10" \
-              "https://api.github.com/repos/${{ github.repository }}/actions/runs/${run_id}")
+              echo
+              echo "----------------------------------------"
+              echo "Workflow : ${name}"
+              echo "Run      : #${run_number}"
+              echo "Run ID   : ${run_id}"
+              echo "Created  : ${created_at}"
+              echo "----------------------------------------"
 
-
-            if echo "$check" | grep -q '"id"'; then
-
-              echo "✅ Run 存在，开始删除: $run_id"
-
-
-              response=$(curl -sS -w '\n%{http_code}' \
+              http_code=$(curl -sS \
+                -o /tmp/delete_response.json \
+                -w "%{http_code}" \
                 -L \
                 -X DELETE \
                 -H "Accept: application/vnd.github+json" \
-                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
                 -H "X-GitHub-Api-Version: 2026-03-10" \
-                "https://api.github.com/repos/${{ github.repository }}/actions/runs/${run_id}")
-
-
-              http_code="$(echo "$response" | tail -n 1)"
-
+                "${API}/${run_id}")
 
               if [ "$http_code" = "204" ]; then
-                echo "✅ 删除成功: $run_id"
+                echo "✅ 删除成功"
+                deleted=$((deleted + 1))
               else
-                echo "❌ 删除失败: $run_id"
-                echo "$response"
+                echo "❌ 删除失败，HTTP ${http_code}"
+
+                if [ -s /tmp/delete_response.json ]; then
+                  cat /tmp/delete_response.json
+                fi
+
+                failed=$((failed + 1))
               fi
 
+            done < <(
+              echo "$response" |
+              jq -r '
+                .workflow_runs[] |
+                [
+                  .id,
+                  .run_number,
+                  .name,
+                  .created_at
+                ] |
+                @tsv
+              '
+            )
 
-            else
+            page=$((page + 1))
 
-              echo "⚠️ Run 不存在或无法访问: $run_id"
-
+            # GitHub 对 status 筛选的搜索结果最多返回 1000 条。
+            if [ "$page" -gt 10 ]; then
+              echo
+              echo "已达到 GitHub API 单次搜索最多 1000 条记录的限制。"
+              break
             fi
 
           done
 
+          echo
+          echo "========================================"
+          echo "清理完成"
+          echo "========================================"
+          echo "发现失败记录 : ${total_found}"
+          echo "删除成功      : ${deleted}"
+          echo "删除失败      : ${failed}"
+          echo "========================================"
 
-          echo "========================================"
-          echo "清理任务结束"
-          echo "========================================"
+          rm -f /tmp/delete_response.json
