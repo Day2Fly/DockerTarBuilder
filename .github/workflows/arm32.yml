@@ -1,201 +1,277 @@
 name: ARM32 Pull and Save Docker Image
 
-
 on:
-
   workflow_dispatch:
-
     inputs:
-
       docker_images:
-
         description: '请输入 Docker 镜像名称，多个镜像使用英文逗号分隔'
-
         required: true
-
         default: 'alpine:latest,ubuntu:latest'
-
         type: string
 
-
-
 permissions:
-
   contents: read
 
-
 jobs:
-
-
   pull_and_package:
-
-
     name: Pull ARM32 Images
-
-
     runs-on: ubuntu-22.04
-
-
-    timeout-minutes: 45
-
-
+    timeout-minutes: 60
 
     steps:
+      - name: Free Disk Space
+        shell: bash
+        run: |
+          set -e
 
+          echo "清理 Runner 磁盘空间..."
 
-    - name: Free Disk Space
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
 
-      run: |
+          docker system prune -af || true
 
-        sudo rm -rf /usr/local/lib/android
+          echo
+          echo "磁盘空间："
+          df -h
 
-        sudo rm -rf /usr/share/dotnet
+      - name: Install zstd and jq
+        shell: bash
+        run: |
+          set -e
 
-        df -h
+          sudo apt-get update
+          sudo apt-get install -y zstd jq
 
+          zstd --version
+          jq --version
 
+      - name: Docker Login
+        shell: bash
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          if [ -n "$DOCKER_USERNAME" ] && [ -n "$DOCKER_PASSWORD" ]; then
+            echo "检测到 Docker Hub 登录凭据，开始登录..."
+            echo "$DOCKER_PASSWORD" | docker login \
+              --username "$DOCKER_USERNAME" \
+              --password-stdin
+          else
+            echo "未配置 Docker Hub 登录凭据，跳过登录。"
+          fi
 
-    - name: Install zstd
+      - name: Pull Docker Images and Package
+        shell: bash
+        env:
+          DOCKER_IMAGES: ${{ inputs.docker_images }}
+        run: |
+          set -u
 
-      run: |
+          mkdir -p output
+          mkdir -p logs
 
-        sudo apt update
+          SUCCESS_FILE="output/success.txt"
+          FAILED_FILE="output/failed.txt"
 
-        sudo apt install -y zstd
+          : > "$SUCCESS_FILE"
+          : > "$FAILED_FILE"
 
+          success_count=0
+          failed_count=0
+          total_count=0
 
+          IFS=',' read -r -a image_array <<< "$DOCKER_IMAGES"
 
-    - name: Pull Docker Images and Package
+          for image in "${image_array[@]}"; do
 
-      shell: bash
+            image="$(echo "$image" | xargs)"
 
-      run: |
+            if [ -z "$image" ]; then
+              continue
+            fi
 
+            total_count=$((total_count + 1))
 
-        mkdir -p output
+            echo
+            echo "=================================================="
+            echo "处理镜像: $image"
+            echo "目标架构: linux/arm/v7"
+            echo "=================================================="
 
+            image_safe="$(echo "$image" | sed 's#[/:@]#_#g')"
+            pull_log="logs/${image_safe}-pull.log"
 
-        images="${{ github.event.inputs.docker_images }}"
+            pull_success=false
 
+            for retry in 1 2 3 4 5; do
 
-        IFS=',' read -ra image_array <<< "$images"
+              echo
+              echo "拉取尝试 ${retry}/5：$image"
 
+              : > "$pull_log"
 
+              set +e
+              docker pull --platform linux/arm/v7 "$image" 2>&1 | tee "$pull_log"
+              pull_status=${PIPESTATUS[0]}
+              set -e
 
-        for image in "${image_array[@]}"
+              if [ "$pull_status" -eq 0 ]; then
+                echo "✅ 镜像拉取成功：$image"
+                pull_success=true
+                break
+              fi
 
-        do
+              echo "❌ docker pull 失败，退出码：$pull_status"
 
+              if grep -Eqi \
+                'manifest unknown|manifest.*unknown|no matching manifest|does not have a matching manifest|pull access denied|access denied|unauthorized|authentication required|insufficient_scope|repository does not exist|repository.*not found|not found: manifest|invalid reference format|reference does not match' \
+                "$pull_log"; then
 
-          image=$(echo "$image" | xargs)
+                echo "⚠️ 检测到不可重试错误，立即跳过该镜像。"
+                break
+              fi
 
+              if grep -Eqi \
+                '429|too many requests|timeout|timed out|TLS handshake timeout|connection reset|connection refused|connection timed out|unexpected EOF|EOF|temporary failure|temporary error|network is unreachable|no route to host|502|503|504|bad gateway|service unavailable|server error|i/o timeout|context deadline exceeded|rate limit' \
+                "$pull_log"; then
 
-          echo "=============================="
+                if [ "$retry" -lt 5 ]; then
+                  echo "🌐 检测到网络/临时错误，20 秒后重试..."
+                  sleep 20
+                else
+                  echo "❌ 网络错误已连续失败 5 次。"
+                fi
 
-          echo "Pulling: $image"
+              else
 
-          echo "=============================="
+                echo "⚠️ 未识别的错误，按照可恢复错误处理。"
 
+                if [ "$retry" -lt 5 ]; then
+                  echo "20 秒后重试..."
+                  sleep 20
+                else
+                  echo "❌ 已重试 5 次，放弃该镜像。"
+                fi
 
-          success=false
+              fi
 
+            done
 
+            if [ "$pull_success" != true ]; then
 
-          for retry in {1..5}
+              echo "❌ 镜像处理失败：$image"
 
-          do
+              echo "$image | linux/arm/v7 | pull failed" >> "$FAILED_FILE"
 
-            docker pull "$image" --platform linux/arm/v7 && success=true && break
+              failed_count=$((failed_count + 1))
 
+              continue
 
-            echo "Pull failed retry ${retry}/5"
+            fi
 
-            sleep 20
+            tar_file="output/${image_safe}-arm32.tar"
+
+            echo
+            echo "开始保存：$tar_file"
+
+            if docker save "$image" -o "$tar_file"; then
+
+              echo "✅ Docker TAR 保存成功：$tar_file"
+
+              echo "$image | linux/arm/v7 | saved" >> "$SUCCESS_FILE"
+
+              success_count=$((success_count + 1))
+
+            else
+
+              echo "❌ Docker save 失败：$image"
+
+              rm -f "$tar_file"
+
+              echo "$image | linux/arm/v7 | docker save failed" >> "$FAILED_FILE"
+
+              failed_count=$((failed_count + 1))
+
+            fi
 
           done
 
+          echo
+          echo "=================================================="
+          echo "镜像处理完成"
+          echo "=================================================="
 
+          echo "总镜像数 : $total_count"
+          echo "成功数量 : $success_count"
+          echo "失败数量 : $failed_count"
 
-          if [ "$success" != true ]; then
+          echo
+          echo "========== SUCCESS =========="
+          cat "$SUCCESS_FILE" || true
 
-            echo "Failed pulling $image"
+          echo
+          echo "========== FAILED =========="
+          cat "$FAILED_FILE" || true
 
-            exit 1
+      - name: Compress Successful Images
+        shell: bash
+        run: |
+          set -e
 
+          cd output
+
+          shopt -s nullglob
+
+          tar_files=(*-arm32.tar)
+
+          if [ "${#tar_files[@]}" -eq 0 ]; then
+            echo "⚠️ 没有成功的 Docker TAR，不生成压缩包。"
+
+            echo "没有可打包的 Docker 镜像。" > package_status.txt
+
+            exit 0
           fi
 
+          echo "以下成功镜像将被打包："
 
+          printf '%s\n' "${tar_files[@]}"
 
-          filename=$(echo "$image" | sed 's#[/:]#_#g')
+          tar -cf arm32-images.tar "${tar_files[@]}"
 
+          zstd -19 --rm \
+            arm32-images.tar \
+            -o arm32-images.tar.zst
 
+          sha256sum arm32-images.tar.zst \
+            > arm32-images.sha256
 
-          docker save "$image" \
+          echo
+          echo "最终文件："
 
-          -o "output/${filename}-arm32.tar"
+          ls -lh \
+            arm32-images.tar.zst \
+            arm32-images.sha256
 
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-images-arm32
+          path: |
+            output/arm32-images.tar.zst
+            output/arm32-images.sha256
+            output/success.txt
+            output/failed.txt
+            output/package_status.txt
+          if-no-files-found: warn
+          retention-days: 7
 
-        done
+      - name: Clean Workspace
+        if: always()
+        shell: bash
+        run: |
+          rm -rf output
+          rm -rf logs
 
-
-
-    - name: Compress Images
-
-
-      run: |
-
-
-        cd output
-
-
-        tar_files=$(ls *-arm32.tar)
-
-
-        tar -cf arm32-images.tar $tar_files
-
-
-        zstd -19 arm32-images.tar \
-
-        -o arm32-images.tar.zst
-
-
-
-        sha256sum arm32-images.tar.zst \
-
-        > arm32-images.sha256
-
-
-
-        rm -f *-arm32.tar arm32-images.tar
-
-
-
-    - name: Upload Artifact
-
-
-      uses: actions/upload-artifact@v4
-
-
-      with:
-
-
-        name: docker-images-arm32
-
-
-        path: |
-
-          output/arm32-images.tar.zst
-
-          output/arm32-images.sha256
-
-
-        retention-days: 7
-
-
-
-    - name: Clean Workspace
-
-
-      run: |
-
-        rm -rf output
+          docker system prune -af || true
