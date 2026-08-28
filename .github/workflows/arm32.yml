@@ -31,6 +31,9 @@ jobs:
         run: |
           set -euo pipefail
 
+          sudo apt-get update
+          sudo apt-get install -y jq
+
           images_json=$(
             printf '%s\n' "$DOCKER_IMAGES" |
             tr ',' '\n' |
@@ -75,7 +78,6 @@ jobs:
         include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
 
     runs-on: ubuntu-22.04
-
     timeout-minutes: 60
 
     steps:
@@ -101,20 +103,16 @@ jobs:
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
         run: |
           if [ -n "$DOCKER_USERNAME" ] && [ -n "$DOCKER_PASSWORD" ]; then
-
             echo "$DOCKER_PASSWORD" |
               docker login \
                 --username "$DOCKER_USERNAME" \
                 --password-stdin
-
           else
-
-            echo "未配置 Docker Hub 登录凭据，跳过登录"
-
+            echo "未配置 Docker Hub 登录凭据，跳过登录。"
           fi
 
 
-      - name: Pull and Save Image
+      - name: Pull Save and Compress Image
         shell: bash
         env:
           IMAGE: ${{ matrix.image }}
@@ -130,9 +128,9 @@ jobs:
           SAFE_NAME="$(echo "$IMAGE" | sed 's#[/:@]#_#g')"
 
           TAR_FILE="output/${INDEX}-${SAFE_NAME}-arm32.tar"
+          ZST_FILE="output/${INDEX}-${SAFE_NAME}-arm32.tar.zst"
 
           RESULT_FILE="result/result.txt"
-
           LOG_FILE="result/pull.log"
 
           pull_success=false
@@ -163,18 +161,13 @@ jobs:
 
             set -e
 
-
             if [ "$pull_status" -eq 0 ]; then
-
-              echo "✅ 拉取成功"
-
+              echo "✅ 镜像拉取成功"
               pull_success=true
               break
-
             fi
 
-
-            echo "❌ Pull 失败，退出码：$pull_status"
+            echo "❌ docker pull 失败，退出码：$pull_status"
 
 
             if grep -Eqi \
@@ -186,7 +179,6 @@ jobs:
               echo "⚠️ $final_reason"
 
               break
-
             fi
 
 
@@ -197,10 +189,8 @@ jobs:
               final_reason="网络或临时错误"
 
               if [ "$retry" -lt 5 ]; then
-
-                echo "🌐 20 秒后重试..."
+                echo "🌐 网络/临时错误，20 秒后重试..."
                 sleep 20
-
               fi
 
             else
@@ -208,10 +198,8 @@ jobs:
               final_reason="未知错误"
 
               if [ "$retry" -lt 5 ]; then
-
                 echo "⚠️ 未识别错误，20 秒后重试..."
                 sleep 20
-
               fi
 
             fi
@@ -229,25 +217,12 @@ jobs:
             } > "$RESULT_FILE"
 
             exit 0
-
           fi
 
 
-          echo
-          echo "开始 docker save..."
-
-          if docker save \
+          if ! docker save \
             "$IMAGE" \
             -o "$TAR_FILE"; then
-
-            {
-              echo "STATUS=success"
-              echo "IMAGE=$IMAGE"
-              echo "PLATFORM=$PLATFORM"
-              echo "FILE=$(basename "$TAR_FILE")"
-            } > "$RESULT_FILE"
-
-          else
 
             rm -f "$TAR_FILE"
 
@@ -258,29 +233,61 @@ jobs:
               echo "REASON=docker save failed"
             } > "$RESULT_FILE"
 
+            exit 0
           fi
 
 
-      - name: Upload Docker TAR
-        if: hashFiles('output/*.tar') != ''
+          if ! zstd \
+            -T0 \
+            -3 \
+            --rm \
+            "$TAR_FILE" \
+            -o "$ZST_FILE"; then
+
+            rm -f "$TAR_FILE"
+            rm -f "$ZST_FILE"
+
+            {
+              echo "STATUS=failed"
+              echo "IMAGE=$IMAGE"
+              echo "PLATFORM=$PLATFORM"
+              echo "REASON=zstd compression failed"
+            } > "$RESULT_FILE"
+
+            exit 0
+          fi
+
+
+          {
+            echo "STATUS=success"
+            echo "IMAGE=$IMAGE"
+            echo "PLATFORM=$PLATFORM"
+            echo "FILE=$(basename "$ZST_FILE")"
+          } > "$RESULT_FILE"
+
+
+      - name: Upload Compressed Image
+        if: hashFiles('output/*.tar.zst') != ''
         uses: actions/upload-artifact@v7
         with:
-          path: output/*.tar
-          archive: false
+          name: docker-image-arm32-${{ matrix.index }}
+          path: output/*.tar.zst
+          archive: true
           compression-level: 0
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 1
 
 
       - name: Upload Result
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: result-${{ matrix.index }}
+          name: result-arm32-${{ matrix.index }}
           path: result/result.txt
+          archive: true
           compression-level: 0
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 1
 
 
       - name: Clean Workspace
@@ -288,6 +295,7 @@ jobs:
         run: |
           rm -rf output
           rm -rf result
+
           docker system prune -af || true
 
 
@@ -301,42 +309,42 @@ jobs:
     if: always() && needs.prepare.result == 'success'
 
     runs-on: ubuntu-22.04
-
     timeout-minutes: 30
 
     steps:
 
-      - name: Install zstd
+      - name: Install zstd and jq
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y zstd
+          sudo apt-get install -y zstd jq
 
 
-      - name: Download Docker TAR Files
+      - name: Download Compressed Images
         uses: actions/download-artifact@v7
         continue-on-error: true
         with:
-          pattern: '*-arm32.tar'
-          path: success-images
+          pattern: docker-image-arm32-*
+          path: compressed-images
           merge-multiple: true
 
 
-      - name: Download Result Files
+      - name: Download Results
         uses: actions/download-artifact@v7
         continue-on-error: true
         with:
-          pattern: result-*
+          pattern: result-arm32-*
           path: results
           merge-multiple: true
 
 
-      - name: Package Images
+      - name: Build Final Package
         shell: bash
         run: |
           set -euo pipefail
 
           mkdir -p output
+          mkdir -p raw-images
 
           SUCCESS_FILE="output/success.txt"
           FAILED_FILE="output/failed.txt"
@@ -360,15 +368,13 @@ jobs:
 
             if [ "$status" = "success" ]; then
 
-              echo "$image | $platform | success" \
-                >> "$SUCCESS_FILE"
+              echo "$image | $platform | success" >> "$SUCCESS_FILE"
 
               success_count=$((success_count + 1))
 
             else
 
-              echo "$image | $platform | $reason" \
-                >> "$FAILED_FILE"
+              echo "$image | $platform | $reason" >> "$FAILED_FILE"
 
               failed_count=$((failed_count + 1))
 
@@ -377,20 +383,41 @@ jobs:
           done
 
 
-          tar_files=(success-images/*-arm32.tar)
+          zst_files=(compressed-images/*.tar.zst)
 
-
-          if [ "${#tar_files[@]}" -eq 0 ]; then
+          if [ "${#zst_files[@]}" -eq 0 ]; then
 
             echo "没有成功的 Docker 镜像。" \
               > output/package_status.txt
 
           else
 
+            for zst_file in "${zst_files[@]}"; do
+
+              base="$(basename "$zst_file" .zst)"
+
+              zstd \
+                -T0 \
+                -d \
+                --rm \
+                "$zst_file" \
+                -o "raw-images/$base"
+
+            done
+
+
+            raw_tar_files=(raw-images/*.tar)
+
+            if [ "${#raw_tar_files[@]}" -eq 0 ]; then
+              echo "❌ 解压后没有 TAR 文件。"
+              exit 1
+            fi
+
+
             tar -cf \
               output/arm32-images.tar \
-              -C success-images \
-              "${tar_files[@]#success-images/}"
+              -C raw-images \
+              "${raw_tar_files[@]#raw-images/}"
 
 
             zstd \
@@ -417,20 +444,16 @@ jobs:
           echo "ARM32 最终统计"
           echo "========================================"
 
-          echo "成功镜像：$success_count"
-          echo "失败镜像：$failed_count"
+          echo "成功：$success_count"
+          echo "失败：$failed_count"
 
           echo
-          echo "========== SUCCESS =========="
           cat "$SUCCESS_FILE" || true
 
           echo
-          echo "========== FAILED =========="
           cat "$FAILED_FILE" || true
 
           echo
-          echo "========== FINAL FILES =========="
-
           find output \
             -maxdepth 1 \
             -type f \
@@ -448,6 +471,7 @@ jobs:
             output/success.txt
             output/failed.txt
             output/package_status.txt
+          archive: true
           compression-level: 0
           retention-days: 7
           if-no-files-found: warn
@@ -456,6 +480,7 @@ jobs:
       - name: Clean Package Workspace
         if: always()
         run: |
-          rm -rf success-images
+          rm -rf compressed-images
+          rm -rf raw-images
           rm -rf results
           rm -rf output
