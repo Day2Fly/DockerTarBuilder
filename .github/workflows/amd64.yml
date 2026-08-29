@@ -1,5 +1,6 @@
 name: AMD64 Pull and Save Docker Image
 
+
 on:
   workflow_dispatch:
     inputs:
@@ -14,48 +15,69 @@ permissions:
   actions: write
 
 
+
 jobs:
 
-# ==============================
-# 生成 Matrix
-# ==============================
+
+# ==================================================
+# Prepare Matrix List
+# ==================================================
 
   prepare:
+
     name: Prepare Image List
+
     runs-on: ubuntu-latest
 
+
     outputs:
-      images: ${{ steps.list.outputs.images }}
+
+      images: ${{ steps.prepare.outputs.images }}
+
+
 
     steps:
 
-      - id: list
+
+      - name: Generate Matrix
+
+        id: prepare
+
         shell: bash
+
         run: |
 
-          IMAGES='${{ inputs.images }}'
 
-          JSON=$(echo "$IMAGES" \
+          IMAGE_LIST="${{ inputs.images }}"
+
+
+          JSON=$(echo "$IMAGE_LIST" \
           | tr ',' '\n' \
-          | sed '/^$/d' \
+          | sed '/^[[:space:]]*$/d' \
           | jq -R . \
-          | jq -c -s .)
-
-          echo "images=$JSON" >> $GITHUB_OUTPUT
+          | jq -c .)
 
 
+          echo "images=$JSON" >> "$GITHUB_OUTPUT"
 
-# ==============================
-# 并行拉取
-# ==============================
+
+
+
+# ==================================================
+# Matrix Pull
+# ==================================================
 
   pull:
 
+
     name: Pull ${{ matrix.image }}
+
 
     needs: prepare
 
+
     runs-on: ubuntu-latest
+
 
     strategy:
 
@@ -66,90 +88,202 @@ jobs:
         image: ${{ fromJson(needs.prepare.outputs.images) }}
 
 
+
     steps:
+
 
 
       - name: Free Disk Space
 
-        run: |
+
+        run:
+
 
           sudo rm -rf \
           /usr/local/lib/android \
-          /opt/ghc \
-          /usr/local/share/powershell
+          /usr/share/dotnet \
+          /opt/ghc
 
 
 
-      - name: Login Docker
 
-        run: |
+      - name: Prepare Directory
 
-          docker login
+
+        run:
+
+
+          mkdir -p output
+
 
 
 
       - name: Pull Docker Image
 
-        id: pull
+
+        id: docker_pull
+
+
+        shell: bash
+
 
         continue-on-error: true
 
+
         run: |
+
 
           IMAGE="${{ matrix.image }}"
 
-          echo "Pull $IMAGE"
+
+          echo "Pulling $IMAGE"
 
 
-          for i in {1..5}
+          ERROR_LOG="pull-error.log"
+
+
+
+          for retry in {1..5}
+
           do
 
-            docker pull "$IMAGE" && break
 
-            echo "retry $i"
+            echo "Attempt $retry / 5"
 
-            sleep 10
+
+
+            if docker pull "$IMAGE" 2>"$ERROR_LOG"
+
+            then
+
+              echo "success=true" >> $GITHUB_OUTPUT
+
+              exit 0
+
+
+            fi
+
+
+
+            ERROR=$(cat "$ERROR_LOG")
+
+
+            echo "$ERROR"
+
+
+
+            if echo "$ERROR" | grep -Eiq \
+            "manifest unknown|no matching manifest|access denied|pull access denied"
+
+            then
+
+              echo "Permanent failure"
+
+              break
+
+            fi
+
+
+
+            sleep 15
+
+
 
           done
 
 
 
-      - name: Save TAR
+          echo "success=false" >> $GITHUB_OUTPUT
 
-        if: steps.pull.outcome == 'success'
+
+
+      - name: Save Docker TAR
+
+
+        if: steps.docker_pull.outputs.success == 'true'
+
+
+        shell: bash
+
 
         run: |
+
+
+          IMAGE="${{ matrix.image }}"
+
+
+          SAFE_NAME=$(echo "$IMAGE" \
+          | sed 's#[/:]#_#g')
+
+
+
+          docker save "$IMAGE" \
+          -o "output/${SAFE_NAME}.tar"
+
+
+
+          SIZE=$(stat -c%s "output/${SAFE_NAME}.tar")
+
+
+
+          if [ "$SIZE" -lt 1024 ]
+
+          then
+
+              echo "Invalid TAR"
+
+              rm -f "output/${SAFE_NAME}.tar"
+
+          fi
+
+
+
+
+      - name: Record Failed Image
+
+
+        if: steps.docker_pull.outputs.success != 'true'
+
+
+        shell: bash
+
+
+        run: |
+
 
           mkdir -p output
 
 
-          NAME=$(echo "${{ matrix.image }}" \
-          | tr '/:' '_')
 
-
-          docker save \
-          "${{ matrix.image }}" \
-          -o "output/${NAME}.tar"
+          IMAGE="${{ matrix.image }}"
 
 
 
-      - name: Upload Matrix TAR
+          echo "$IMAGE" >> output/failed.txt
 
-        if: false
+
+
+
+      - name: Upload Matrix Result
+
 
         uses: actions/upload-artifact@v4
 
+
         with:
 
-          name: hidden
+
+          name: matrix-${{ strategy.job-index }}
+
 
           path: output
 
 
 
-# ==============================
-# 打包阶段
-# ==============================
+
+# ==================================================
+# Package
+# ==================================================
 
   package:
 
@@ -163,82 +297,171 @@ jobs:
     runs-on: ubuntu-latest
 
 
+
+
     steps:
 
 
-      - name: Download all TAR
+
+      - name: Download Matrix Results
+
 
         uses: actions/download-artifact@v4
 
+
         with:
+
+
+          pattern: matrix-*
+
+
+          merge-multiple: true
+
 
           path: input
 
 
 
+
       - name: Install zstd
 
-        run: |
+
+        run:
+
 
           sudo apt update
+
 
           sudo apt install -y zstd
 
 
 
-      - name: Merge Package
+
+      - name: Package Docker Images
+
 
         shell: bash
 
+
         run: |
 
-          mkdir package
 
 
-          find input \
-          -name "*.tar" \
-          -exec cp {} package/ \;
-
-
-          mkdir result
-
-
-          echo "Docker Image Package" > result/result-amd64.txt
-
-          echo "" >> result/result-amd64.txt
-
-
-          echo "Images:" >> result/result-amd64.txt
-
-
-          ls package/*.tar \
-          >> result/result-amd64.txt
+          mkdir -p package
 
 
 
-          tar \
-          -cf docker-images-amd64.tar \
+          SUCCESS=0
+
+
+
+          FAILED=0
+
+
+
+
+          if ls input/*.tar >/dev/null 2>&1
+
+          then
+
+
+              for file in input/*.tar
+
+              do
+
+
+                  SIZE=$(stat -c%s "$file")
+
+
+
+                  if [ "$SIZE" -gt 1024 ]
+
+                  then
+
+                      cp "$file" package/
+
+                      SUCCESS=$((SUCCESS+1))
+
+                  else
+
+                      rm -f "$file"
+
+                  fi
+
+
+              done
+
+
+          fi
+
+
+
+
+          tar -cf docker-images-amd64.tar \
           -C package .
 
 
 
-          zstd \
-          -19 \
+          zstd -19 \
           docker-images-amd64.tar \
           -o docker-images-amd64.tar.zst
 
 
 
+
+          echo "Docker Image Result" > result-amd64.txt
+
+
+          echo "" >> result-amd64.txt
+
+
+          echo "Success Images: $SUCCESS" >> result-amd64.txt
+
+
+
+          echo "" >> result-amd64.txt
+
+
+          echo "Files:" >> result-amd64.txt
+
+
+
+          ls package >> result-amd64.txt || true
+
+
+
+          if [ -f input/failed.txt ]
+
+          then
+
+              cp input/failed.txt failed-amd64.txt
+
+          else
+
+              echo "No failed images" > failed-amd64.txt
+
+          fi
+
+
+
+
       - name: Upload Final Package
+
 
         uses: actions/upload-artifact@v4
 
+
         with:
+
 
           name: docker-images-amd64
 
+
           path: |
+
 
             docker-images-amd64.tar.zst
 
-            result/result-amd64.txt
+            result-amd64.txt
+
+            failed-amd64.txt
