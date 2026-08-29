@@ -1,373 +1,257 @@
 name: ARM32 Pull and Save Docker Image
 
-
 on:
   workflow_dispatch:
-
     inputs:
-
       images:
-
         description: "请输入 Docker 镜像名称，多个镜像使用英文逗号分隔"
-
         required: true
-
         default: "alpine:latest,ubuntu:latest"
-
         type: string
 
-
 permissions:
-
   contents: read
-
   actions: write
-
-
 
 jobs:
 
-
   # ==========================================================
-  # 1. Prepare Image List
+  # 1. Prepare
   # ==========================================================
-
   prepare:
-
     name: Prepare Image List
-
     runs-on: ubuntu-latest
-
     timeout-minutes: 5
 
-
     outputs:
-
       matrix: ${{ steps.prepare.outputs.matrix }}
 
-
     steps:
-
-
       - name: Prepare Image List
-
         id: prepare
-
         shell: bash
-
         env:
-
           IMAGE_LIST: ${{ inputs.images }}
-
-
         run: |
-
           set -euo pipefail
 
-
           echo "========================================"
-
-          echo "原始输入："
-
-          echo "$IMAGE_LIST"
-
+          echo "原始输入"
           echo "========================================"
-
-
+          printf '%s\n' "$IMAGE_LIST"
 
           # --------------------------------------------------
-          # 清理输入
+          # 规范化输入
           #
           # 支持：
           # image1,image2
           # image1, image2
           # "image1","image2"
-          # 中文逗号
+          # image1，image2
+          #
+          # 同时：
+          # - 删除空行
+          # - 删除重复镜像
+          # - 去掉首尾空格
           # --------------------------------------------------
-
           CLEANED_LIST="$(
-            printf '%s' "$IMAGE_LIST" |
+            printf '%s\n' "$IMAGE_LIST" |
             tr '，' ',' |
             sed 's/"//g' |
             tr ',' '\n' |
             sed 's/^[[:space:]]*//;s/[[:space:]]*$//' |
-            awk 'NF'
+            awk 'NF' |
+            awk '!seen[$0]++'
           )"
 
-
-
           if [ -z "$CLEANED_LIST" ]; then
-
             echo "❌ 没有检测到有效的 Docker 镜像。"
-
             exit 1
-
           fi
 
-
-
           echo
-
-          echo "清理后的镜像列表："
+          echo "========================================"
+          echo "清理后的镜像列表"
+          echo "========================================"
 
           printf '%s\n' "$CLEANED_LIST"
 
-
-
           # --------------------------------------------------
-          # 生成单行 JSON
+          # 生成 Matrix JSON
+          #
+          # 例如：
+          # [
+          #   {
+          #     "index": 0,
+          #     "image": "image1"
+          #   },
+          #   {
+          #     "index": 1,
+          #     "image": "image2"
+          #   }
+          # ]
+          #
+          # 这里过滤空项，避免产生额外的：
+          # Pull
+          # 空 Matrix Job
           # --------------------------------------------------
-
           MATRIX="$(
             printf '%s\n' "$CLEANED_LIST" |
             jq -R -s -c '
               split("\n")
               | map(select(length > 0))
+              | to_entries
+              | map({
+                  index: .key,
+                  image: .value
+                })
             '
           )"
 
-
-
-          # --------------------------------------------------
-          # 验证 JSON
-          # --------------------------------------------------
-
-          echo "$MATRIX" | jq -e . >/dev/null
-
-
-
-          IMAGE_COUNT="$(echo "$MATRIX" | jq 'length')"
-
-
+          IMAGE_COUNT="$(printf '%s' "$MATRIX" | jq 'length')"
 
           if [ "$IMAGE_COUNT" -eq 0 ]; then
-
             echo "❌ Matrix 中没有有效镜像。"
-
             exit 1
-
           fi
 
-
-
           echo
-
           echo "========================================"
-
           echo "Matrix 镜像数量：$IMAGE_COUNT"
-
           echo "========================================"
 
-          echo "$MATRIX" | jq .
-
-
+          printf '%s\n' "$MATRIX" | jq .
 
           # --------------------------------------------------
-          # 关键：
           # 单行写入 GITHUB_OUTPUT
           # 避免 Invalid format
           # --------------------------------------------------
-
           printf 'matrix=%s\n' "$MATRIX" >> "$GITHUB_OUTPUT"
 
-
-
           echo
-
-          echo "✅ Matrix 准备完成"
-
-
+          echo "✅ Prepare 完成"
 
 
   # ==========================================================
-  # 2. Matrix Pull / Save / Compress
+  # 2. Matrix 并行 Pull / Save / Compress
   # ==========================================================
-
   pull:
-
     name: "Pull ${{ matrix.image }}"
 
     needs: prepare
 
-
     strategy:
-
       fail-fast: false
-
       max-parallel: 4
 
-
       matrix:
-
-        image: ${{ fromJSON(needs.prepare.outputs.matrix) }}
-
+        include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
 
     runs-on: ubuntu-latest
-
     timeout-minutes: 60
-
 
     steps:
 
-
       # ------------------------------------------------------
-      # 清理磁盘
+      # 清理 Runner
       # ------------------------------------------------------
-
       - name: Free Disk Space
-
         shell: bash
-
         run: |
-
           set -e
 
-
-          echo "清理 Runner 空间..."
-
+          echo "清理 Runner 磁盘空间..."
 
           sudo rm -rf /usr/local/lib/android || true
-
           sudo rm -rf /usr/share/dotnet || true
-
           sudo rm -rf /opt/ghc || true
-
 
           docker system prune -af || true
 
-
           echo
-
+          echo "当前磁盘："
           df -h
-
 
 
       # ------------------------------------------------------
       # 安装工具
       # ------------------------------------------------------
-
       - name: Install Tools
-
         shell: bash
-
         run: |
-
           set -e
 
-
           sudo apt-get update
-
           sudo apt-get install -y zstd jq
 
-
+          echo
           zstd --version
-
           jq --version
 
 
-
       # ------------------------------------------------------
-      # Docker Login
+      # Docker Hub Login
+      #
+      # 注意：
+      # secrets 不直接放在 if 中
       # ------------------------------------------------------
-
       - name: Docker Login
-
         shell: bash
-
         env:
-
           DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
-
-
         run: |
-
           if [ -n "$DOCKER_USERNAME" ] && [ -n "$DOCKER_PASSWORD" ]; then
-
 
             echo "检测到 Docker Hub 登录凭据，开始登录..."
 
-
             echo "$DOCKER_PASSWORD" |
-
               docker login \
-
                 --username "$DOCKER_USERNAME" \
-
                 --password-stdin
-
 
           else
 
-
-            echo "未配置 Docker Hub 登录凭据，跳过 Docker Hub 登录。"
-
+            echo "未配置 Docker Hub 登录凭据，跳过登录。"
 
           fi
 
 
-
       # ------------------------------------------------------
-      # Pull → Save → Compress
+      # Pull → Save → Zstd
       # ------------------------------------------------------
-
-      - name: Pull Save and Compress Image
-
+      - name: Pull Save and Compress
         shell: bash
-
         env:
-
           IMAGE: ${{ matrix.image }}
-
-
+          INDEX: ${{ matrix.index }}
         run: |
-
           set -u
-
 
           PLATFORM="linux/arm/v7"
 
-
-          mkdir -p output
-
-          mkdir -p result
-
-
+          mkdir -p bundle
+          mkdir -p logs
 
           SAFE_NAME="$(
             printf '%s' "$IMAGE" |
             sed 's#[/:@]#_#g'
           )"
 
+          TAR_FILE="bundle/${SAFE_NAME}-arm32.tar"
+          ZST_FILE="bundle/${SAFE_NAME}-arm32.tar.zst"
 
-
-          TAR_FILE="output/${SAFE_NAME}-arm32.tar"
-
-          ZST_FILE="output/${SAFE_NAME}-arm32.tar.zst"
-
-
-
-          RESULT_FILE="result/result.txt"
-
-          LOG_FILE="result/pull.log"
-
-
+          RESULT_FILE="bundle/result.txt"
+          LOG_FILE="logs/pull.log"
 
           PULL_SUCCESS=false
-
           FINAL_REASON=""
 
-
-
           echo "=================================================="
-
           echo "镜像：$IMAGE"
-
           echo "平台：$PLATFORM"
-
+          echo "Matrix Index：$INDEX"
           echo "=================================================="
-
 
 
           # ==================================================
@@ -376,207 +260,131 @@ jobs:
 
           for retry in 1 2 3 4 5; do
 
-
             echo
-
             echo "========================================"
-
             echo "Pull 尝试 ${retry}/5"
-
-            echo "镜像：$IMAGE"
-
             echo "========================================"
-
 
             : > "$LOG_FILE"
 
-
-
-            # 只执行一次 docker pull
-
             set +e
 
-
             docker pull \
-
               --platform "$PLATFORM" \
-
               "$IMAGE" \
-
               2>&1 |
-
               tee "$LOG_FILE"
-
 
             PULL_STATUS=${PIPESTATUS[0]}
 
-
             set -e
-
-
 
             if [ "$PULL_STATUS" -eq 0 ]; then
 
-
               echo
-
               echo "✅ Docker Pull 成功"
 
-
               PULL_SUCCESS=true
-
               break
-
 
             fi
 
-
-
             echo
-
             echo "❌ Docker Pull 失败，退出码：$PULL_STATUS"
 
 
-
-            # ==================================================
-            # 不可重试错误
-            # ==================================================
-
+            # ------------------------------------------------
+            # 确定性错误
+            # 不重试
+            # ------------------------------------------------
             if grep -Eqi \
               'manifest unknown|manifest.*unknown|no matching manifest|does not have a matching manifest|pull access denied|access denied|unauthorized|authentication required|insufficient_scope|repository does not exist|repository.*not found|not found: manifest|invalid reference format|reference does not match' \
               "$LOG_FILE"; then
 
-
               FINAL_REASON="不可重试：镜像/Tag/ARM32架构不存在或无权限"
 
-
-              echo
-
               echo "⚠️ $FINAL_REASON"
-
 
               break
 
             fi
 
 
-
-            # ==================================================
+            # ------------------------------------------------
             # 网络 / 临时错误
-            # ==================================================
-
+            # ------------------------------------------------
             if grep -Eqi \
               '429|too many requests|timeout|timed out|TLS handshake timeout|connection reset|connection refused|connection timed out|unexpected EOF|EOF|temporary failure|temporary error|network is unreachable|no route to host|502|503|504|bad gateway|service unavailable|server error|i/o timeout|context deadline exceeded|rate limit' \
               "$LOG_FILE"; then
 
-
               FINAL_REASON="网络或临时错误"
-
 
               if [ "$retry" -lt 5 ]; then
 
-
                 echo
-
                 echo "🌐 检测到网络/临时错误"
-
                 echo "20 秒后重试..."
-
 
                 sleep 20
 
-
               else
 
-
                 echo
-
                 echo "❌ 网络错误已连续失败 5 次"
 
-
               fi
-
 
             else
 
-
               FINAL_REASON="未知错误"
-
 
               if [ "$retry" -lt 5 ]; then
 
-
                 echo
-
                 echo "⚠️ 未识别错误"
-
                 echo "20 秒后重试..."
-
 
                 sleep 20
 
-
               else
 
-
                 echo
-
                 echo "❌ 未知错误连续失败 5 次"
-
 
               fi
 
-
             fi
-
 
           done
 
 
-
           # ==================================================
-          # Pull 最终失败
+          # Pull 失败
           # ==================================================
 
           if [ "$PULL_SUCCESS" != true ]; then
 
-
             echo
-
             echo "=================================================="
-
-            echo "❌ 镜像最终失败"
-
+            echo "❌ 镜像处理失败"
             echo "镜像：$IMAGE"
-
             echo "原因：$FINAL_REASON"
-
             echo "=================================================="
-
-
 
             {
-
               echo "STATUS=failed"
-
               echo "IMAGE=$IMAGE"
-
               echo "PLATFORM=$PLATFORM"
-
               echo "REASON=$FINAL_REASON"
-
             } > "$RESULT_FILE"
 
+            rm -f "$TAR_FILE" "$ZST_FILE"
 
-
-            # 重要：
-            # Pull 失败后正常结束这个 Matrix Job，
-            # 让其它镜像继续执行。
-
+            # 当前 Matrix 正常结束
+            # 其它 Matrix Job 不受影响
             exit 0
 
           fi
-
 
 
           # ==================================================
@@ -584,90 +392,79 @@ jobs:
           # ==================================================
 
           echo
-
           echo "========================================"
-
           echo "开始 Docker Save"
-
           echo "========================================"
-
-
 
           if ! docker save \
-
             "$IMAGE" \
-
             -o "$TAR_FILE"; then
-
 
             echo "❌ Docker Save 失败"
 
-
-            rm -f "$TAR_FILE"
-
+            rm -f "$TAR_FILE" "$ZST_FILE"
 
             {
-
               echo "STATUS=failed"
-
               echo "IMAGE=$IMAGE"
-
               echo "PLATFORM=$PLATFORM"
-
               echo "REASON=docker save failed"
-
             } > "$RESULT_FILE"
-
 
             exit 0
 
           fi
 
 
-
           # ==================================================
-          # 检查 TAR
+          # TAR 大小检查
           # ==================================================
 
           TAR_SIZE="$(stat -c '%s' "$TAR_FILE")"
 
-
           echo
-
           echo "TAR 大小：${TAR_SIZE} bytes"
-
-
 
           if [ "$TAR_SIZE" -lt 1024 ]; then
 
-
-            echo "❌ TAR 文件异常，小于 1 KiB"
-
+            echo "❌ TAR 小于 1 KiB，判定为异常文件"
 
             rm -f "$TAR_FILE"
 
-
             {
-
               echo "STATUS=failed"
-
               echo "IMAGE=$IMAGE"
-
               echo "PLATFORM=$PLATFORM"
-
               echo "REASON=invalid or empty docker tar"
-
             } > "$RESULT_FILE"
-
 
             exit 0
 
           fi
 
 
+          # ==================================================
+          # TAR 完整性检查
+          # ==================================================
 
-          echo "✅ TAR 文件有效"
+          if ! tar -tf "$TAR_FILE" >/dev/null 2>&1; then
 
+            echo "❌ TAR 文件无法正常读取"
+
+            rm -f "$TAR_FILE"
+
+            {
+              echo "STATUS=failed"
+              echo "IMAGE=$IMAGE"
+              echo "PLATFORM=$PLATFORM"
+              echo "REASON=corrupted docker tar"
+            } > "$RESULT_FILE"
+
+            exit 0
+
+          fi
+
+          echo "✅ TAR 校验通过"
 
 
           # ==================================================
@@ -675,90 +472,78 @@ jobs:
           # ==================================================
 
           echo
-
           echo "========================================"
-
           echo "开始 Zstandard 压缩"
-
           echo "========================================"
-
-
 
           if ! zstd \
-
             -T0 \
-
             -3 \
-
             --rm \
-
             "$TAR_FILE" \
-
             -o "$ZST_FILE"; then
-
 
             echo "❌ Zstandard 压缩失败"
 
-
-            rm -f "$TAR_FILE"
-
-            rm -f "$ZST_FILE"
-
+            rm -f "$TAR_FILE" "$ZST_FILE"
 
             {
-
               echo "STATUS=failed"
-
               echo "IMAGE=$IMAGE"
-
               echo "PLATFORM=$PLATFORM"
-
               echo "REASON=zstd compression failed"
-
             } > "$RESULT_FILE"
-
 
             exit 0
 
           fi
-
 
 
           ZST_SIZE="$(stat -c '%s' "$ZST_FILE")"
 
-
           echo
-
-          echo "压缩后大小：${ZST_SIZE} bytes"
-
-
+          echo "ZST 大小：${ZST_SIZE} bytes"
 
           if [ "$ZST_SIZE" -lt 1024 ]; then
 
-
-            echo "❌ ZST 文件异常"
-
+            echo "❌ ZST 小于 1 KiB，判定为异常文件"
 
             rm -f "$ZST_FILE"
 
-
             {
-
               echo "STATUS=failed"
-
               echo "IMAGE=$IMAGE"
-
               echo "PLATFORM=$PLATFORM"
-
               echo "REASON=invalid compressed file"
-
             } > "$RESULT_FILE"
-
 
             exit 0
 
           fi
 
+
+          # ==================================================
+          # ZST 完整性检查
+          # ==================================================
+
+          if ! zstd -t "$ZST_FILE" >/dev/null 2>&1; then
+
+            echo "❌ ZST 完整性检查失败"
+
+            rm -f "$ZST_FILE"
+
+            {
+              echo "STATUS=failed"
+              echo "IMAGE=$IMAGE"
+              echo "PLATFORM=$PLATFORM"
+              echo "REASON=corrupted compressed file"
+            } > "$RESULT_FILE"
+
+            exit 0
+
+          fi
+
+          echo "✅ ZST 校验通过"
 
 
           # ==================================================
@@ -766,130 +551,73 @@ jobs:
           # ==================================================
 
           {
-
             echo "STATUS=success"
-
             echo "IMAGE=$IMAGE"
-
             echo "PLATFORM=$PLATFORM"
-
             echo "FILE=$(basename "$ZST_FILE")"
-
             echo "SIZE=$ZST_SIZE"
-
           } > "$RESULT_FILE"
 
 
+          echo
+          echo "=================================================="
+          echo "✅ Matrix 镜像处理完成"
+          echo "=================================================="
+
+          ls -lh bundle
 
           echo
-
-          echo "✅ 镜像处理完成"
-
-
-
-          ls -lh output
-
           cat "$RESULT_FILE"
 
 
-
       # ======================================================
-      # Matrix 临时 Artifact
+      # 3. Matrix 临时 Artifact
+      #
+      # 每个 Matrix Job 只上传自己的：
+      #   *.tar.zst
+      #   result.txt
+      #
+      # Package 后面通过 REST API 下载。
       # ======================================================
-
-      - name: Upload Compressed Image
-
-        if: hashFiles('output/*.tar.zst') != ''
-
+      - name: Upload Matrix Artifact
+        if: always()
         uses: actions/upload-artifact@v7
-
         with:
-
-          name: arm32-image-${{ strategy.job-index }}
-
-          path: output/*.tar.zst
-
-          archive: true
-
+          name: matrix-arm32-${{ matrix.index }}
+          path: bundle/*
           compression-level: 0
-
+          retention-days: 1
           if-no-files-found: error
 
-          retention-days: 1
-
-
 
       # ======================================================
-      # Matrix 结果
+      # 4. 清理 Matrix Runner
       # ======================================================
-
-      - name: Upload Result
-
+      - name: Clean Matrix Workspace
         if: always()
-
-        uses: actions/upload-artifact@v7
-
-        with:
-
-          name: arm32-result-${{ strategy.job-index }}
-
-          path: result/result.txt
-
-          archive: true
-
-          compression-level: 0
-
-          if-no-files-found: error
-
-          retention-days: 1
-
-
-
-      # ======================================================
-      # 清理 Runner
-      # ======================================================
-
-      - name: Clean Workspace
-
-        if: always()
-
         shell: bash
-
         run: |
-
-          rm -rf output
-
-          rm -rf result
-
+          rm -rf bundle
+          rm -rf logs
 
           docker system prune -af || true
 
 
-
-
   # ==========================================================
-  # 3. Package
+  # 5. Package
   # ==========================================================
-
   package:
-
     name: Package ARM32 Images
 
-
     needs:
-
       - prepare
-
       - pull
 
-
+    # 部分 Matrix 失败也必须进入 Package
     if: always() && needs.prepare.result == 'success'
 
-
     runs-on: ubuntu-latest
-
     timeout-minutes: 30
-
 
     steps:
 
@@ -897,585 +625,575 @@ jobs:
       # ------------------------------------------------------
       # 安装工具
       # ------------------------------------------------------
-
       - name: Install Tools
-
         shell: bash
-
         run: |
-
           set -e
 
-
           sudo apt-get update
+          sudo apt-get install -y zstd jq unzip
 
-          sudo apt-get install -y zstd jq
-
-
-
-      # ------------------------------------------------------
-      # 下载 Matrix 压缩包
-      # ------------------------------------------------------
-
-      - name: Download Compressed Images
-
-        uses: actions/download-artifact@v7
-
-        continue-on-error: true
-
-        with:
-
-          pattern: arm32-image-*
-
-          path: compressed-images
-
-          merge-multiple: true
-
+          zstd --version
+          jq --version
 
 
       # ------------------------------------------------------
-      # 下载 Matrix 结果
+      # 准备目录
       # ------------------------------------------------------
-
-      - name: Download Results
-
-        uses: actions/download-artifact@v7
-
-        continue-on-error: true
-
-        with:
-
-          pattern: arm32-result-*
-
-          path: results
-
-          merge-multiple: true
-
-
-
-      # ------------------------------------------------------
-      # Build Final Package
-      # ------------------------------------------------------
-
-      - name: Build Final ARM32 Package
-
+      - name: Prepare Package Workspace
         shell: bash
-
         run: |
+          set -e
 
-          set -euo pipefail
-
-
+          mkdir -p temp-artifacts
+          mkdir -p extracted
+          mkdir -p raw-images
           mkdir -p output
 
-          mkdir -p raw-images
+
+      # ======================================================
+      # 6. 通过 GitHub REST API 下载当前 Run 的 Matrix Artifact
+      # ======================================================
+      - name: Download Matrix Artifacts via GitHub API
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          API="https://api.github.com/repos/${REPO}/actions/runs/${RUN_ID}/artifacts"
 
 
+          echo "========================================"
+          echo "读取当前 Workflow Run Artifacts"
+          echo "Run ID: ${RUN_ID}"
+          echo "========================================"
+
+
+          response="$(
+            curl -fsSL \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "${API}?per_page=100"
+          )"
+
+
+          echo
+          echo "当前 Artifacts："
+
+
+          echo "$response" |
+            jq -r '
+              .artifacts[] |
+              "\(.id)\t\(.name)\t\(.size_in_bytes) bytes\texpired=\(.expired)"
+            ' || true
+
+
+          # --------------------------------------------------
+          # 只处理 Matrix Artifact
+          # --------------------------------------------------
+          artifact_count="$(
+            echo "$response" |
+            jq '
+              [
+                .artifacts[]
+                | select(
+                    (.name | startswith("matrix-arm32-"))
+                    and (.expired == false)
+                  )
+              ]
+              | length
+            '
+          )"
+
+
+          echo
+          echo "Matrix Artifact 数量：${artifact_count}"
+
+
+          if [ "$artifact_count" -eq 0 ]; then
+
+            echo "⚠️ 没有找到 Matrix Artifact"
+
+            exit 0
+
+          fi
+
+
+          # --------------------------------------------------
+          # 下载每个 Matrix Artifact
+          # --------------------------------------------------
+          echo "$response" |
+            jq -r '
+              .artifacts[]
+              | select(
+                  (.name | startswith("matrix-arm32-"))
+                  and (.expired == false)
+                )
+              | [
+                  .id,
+                  .name,
+                  .archive_download_url
+                ]
+              | @tsv
+            ' |
+          while IFS=$'\t' read -r artifact_id artifact_name download_url; do
+
+            [ -n "$artifact_id" ] || continue
+
+
+            echo
+            echo "========================================"
+            echo "下载 Matrix Artifact"
+            echo "ID   : ${artifact_id}"
+            echo "Name : ${artifact_name}"
+            echo "========================================"
+
+
+            zip_file="temp-artifacts/${artifact_name}.zip"
+            extract_dir="extracted/${artifact_name}"
+
+
+            mkdir -p "$extract_dir"
+
+
+            # GitHub API 会返回 302
+            # curl -L 跟随跳转
+            curl -fL \
+              --retry 5 \
+              --retry-delay 5 \
+              --retry-all-errors \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "$download_url" \
+              -o "$zip_file"
+
+
+            echo "✅ Artifact 下载完成"
+
+
+            unzip -q \
+              "$zip_file" \
+              -d "$extract_dir"
+
+
+            echo "✅ Artifact 解压完成"
+
+
+            rm -f "$zip_file"
+
+          done
+
+
+      # ======================================================
+      # 7. 汇总成功 / 失败结果
+      # ======================================================
+      - name: Collect Results
+        shell: bash
+        run: |
+          set -euo pipefail
 
           SUCCESS_FILE="output/success.txt"
-
           FAILED_FILE="output/failed.txt"
 
-
-
           : > "$SUCCESS_FILE"
-
           : > "$FAILED_FILE"
 
-
-
           success_count=0
-
           failed_count=0
 
 
-
+          echo "========================================"
+          echo "读取 Matrix 处理结果"
           echo "========================================"
 
-          echo "读取 Matrix 结果"
-
-          echo "========================================"
-
-
-
-          # ==================================================
-          # 汇总 Matrix 结果
-          # ==================================================
 
           shopt -s nullglob
 
-
-          result_files=(results/*.txt)
-
+          result_files=(extracted/*/result.txt)
 
 
-          if [ "${#result_files[@]}" -gt 0 ]; then
+          if [ "${#result_files[@]}" -eq 0 ]; then
 
+            echo "⚠️ 没有找到 Matrix 结果文件。"
+
+          else
 
             for file in "${result_files[@]}"; do
 
-
               echo
-
               echo "----------------------------------------"
-
               echo "结果文件：$file"
-
               echo "----------------------------------------"
 
 
               cat "$file"
 
 
-
               STATUS="$(grep '^STATUS=' "$file" | cut -d= -f2- || true)"
-
               IMAGE="$(grep '^IMAGE=' "$file" | cut -d= -f2- || true)"
-
               PLATFORM="$(grep '^PLATFORM=' "$file" | cut -d= -f2- || true)"
-
               REASON="$(grep '^REASON=' "$file" | cut -d= -f2- || true)"
 
 
               if [ "$STATUS" = "success" ]; then
 
-
                 echo "$IMAGE | $PLATFORM | success" \
                   >> "$SUCCESS_FILE"
 
-
                 success_count=$((success_count + 1))
 
-
               else
-
 
                 echo "$IMAGE | $PLATFORM | $REASON" \
                   >> "$FAILED_FILE"
 
-
                 failed_count=$((failed_count + 1))
-
 
               fi
 
-
             done
-
-
-          else
-
-
-            echo "⚠️ 没有找到 Matrix 结果文件。"
-
 
           fi
 
 
+          echo
+          echo "========================================"
+          echo "Matrix 统计"
+          echo "========================================"
 
-          # ==================================================
-          # 查找成功镜像
-          # ==================================================
+          echo "成功：$success_count"
+          echo "失败：$failed_count"
 
-          zst_files=(compressed-images/*.tar.zst)
 
+      # ======================================================
+      # 8. 解压并校验 Matrix ZST
+      # ======================================================
+      - name: Extract and Validate Images
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          shopt -s nullglob
+
+          zst_files=(extracted/*/*.tar.zst)
+
+          valid_count=0
+          invalid_count=0
+
+
+          echo "========================================"
+          echo "检查 Matrix ZST"
+          echo "========================================"
+
+
+          for zst_file in "${zst_files[@]}"; do
+
+            echo
+            echo "检查：$zst_file"
+
+
+            zst_size="$(stat -c '%s' "$zst_file")"
+
+
+            if [ "$zst_size" -lt 1024 ]; then
+
+              echo "⚠️ ZST 太小，删除：$zst_file"
+
+              rm -f "$zst_file"
+
+              invalid_count=$((invalid_count + 1))
+
+              continue
+
+            fi
+
+
+            # ------------------------------------------------
+            # ZST 完整性
+            # ------------------------------------------------
+            if ! zstd -t "$zst_file" >/dev/null 2>&1; then
+
+              echo "❌ ZST 已损坏，删除：$zst_file"
+
+              rm -f "$zst_file"
+
+              invalid_count=$((invalid_count + 1))
+
+              continue
+
+            fi
+
+
+            # ------------------------------------------------
+            # 解压
+            # ------------------------------------------------
+            base="$(basename "$zst_file" .zst)"
+
+            output_tar="raw-images/$base"
+
+
+            if ! zstd \
+              -T0 \
+              -d \
+              "$zst_file" \
+              -o "$output_tar"; then
+
+              echo "❌ ZST 解压失败，删除：$zst_file"
+
+              rm -f "$zst_file"
+              rm -f "$output_tar"
+
+              invalid_count=$((invalid_count + 1))
+
+              continue
+
+            fi
+
+
+            # ------------------------------------------------
+            # TAR 大小
+            # ------------------------------------------------
+            tar_size="$(stat -c '%s' "$output_tar")"
+
+
+            if [ "$tar_size" -lt 1024 ]; then
+
+              echo "❌ TAR 太小，删除：$output_tar"
+
+              rm -f "$output_tar"
+
+              invalid_count=$((invalid_count + 1))
+
+              continue
+
+            fi
+
+
+            # ------------------------------------------------
+            # TAR 完整性
+            # ------------------------------------------------
+            if ! tar -tf "$output_tar" >/dev/null 2>&1; then
+
+              echo "❌ TAR 损坏，删除：$output_tar"
+
+              rm -f "$output_tar"
+
+              invalid_count=$((invalid_count + 1))
+
+              continue
+
+            fi
+
+
+            echo "✅ TAR 有效"
+
+            valid_count=$((valid_count + 1))
+
+
+            # 成功解压后，不再保留 Matrix ZST
+            rm -f "$zst_file"
+
+          done
 
 
           echo
-
+          echo "========================================"
+          echo "有效 TAR：$valid_count"
+          echo "异常 TAR：$invalid_count"
           echo "========================================"
 
-          echo "成功压缩包数量：${#zst_files[@]}"
 
-          echo "========================================"
+      # ======================================================
+      # 9. 创建最终 ARM32 包
+      # ======================================================
+      - name: Build Final ARM32 Package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          shopt -s nullglob
+
+          tar_files=(raw-images/*.tar)
 
 
+          if [ "${#tar_files[@]}" -eq 0 ]; then
 
-          # ==================================================
-          # 没有成功镜像
-          # ==================================================
-
-          if [ "${#zst_files[@]}" -eq 0 ]; then
-
-
-            echo "没有任何成功镜像。"
-
+            echo "⚠️ 没有任何有效 Docker TAR"
 
             echo "没有成功的 Docker 镜像。" \
               > output/package_status.txt
 
-
           else
 
+            echo
+            echo "========================================"
+            echo "准备合并 ${#tar_files[@]} 个 Docker TAR"
+            echo "========================================"
 
-            # ==================================================
-            # 解压 Matrix TAR.ZST
-            # ==================================================
+            printf '%s\n' "${tar_files[@]}"
+
+
+            # ------------------------------------------------
+            # 合并所有成功镜像
+            # ------------------------------------------------
+            tar \
+              -cf \
+              output/docker-images-arm32.tar \
+              -C raw-images \
+              "${tar_files[@]#raw-images/}"
+
+
+            final_tar_size="$(
+              stat -c '%s' output/docker-images-arm32.tar
+            )"
+
 
             echo
+            echo "最终 TAR 大小：${final_tar_size} bytes"
 
-            echo "开始解压 Matrix TAR.ZST..."
 
+            if [ "$final_tar_size" -lt 1024 ]; then
 
+              echo "❌ 最终 TAR 异常"
 
-            for zst_file in "${zst_files[@]}"; do
+              rm -f output/docker-images-arm32.tar
 
-
-              base="$(basename "$zst_file" .zst)"
-
-
-              echo "解压：$base"
-
-
-
-              if ! zstd \
-
-                -T0 \
-
-                -d \
-
-                --rm \
-
-                "$zst_file" \
-
-                -o "raw-images/$base"; then
-
-
-                echo "❌ 解压失败：$zst_file"
-
-                exit 1
-
-
-              fi
-
-
-            done
-
-
-
-            # ==================================================
-            # 检查所有 TAR
-            # ==================================================
-
-            raw_tar_files=(raw-images/*.tar)
-
-            valid_tar_files=()
-
-
-
-            for tar_file in "${raw_tar_files[@]}"; do
-
-
-              [ -f "$tar_file" ] || continue
-
-
-              size="$(stat -c '%s' "$tar_file")"
-
-
-              if [ "$size" -lt 1024 ]; then
-
-
-                echo "⚠️ 删除异常 TAR：$(basename "$tar_file")"
-
-
-                rm -f "$tar_file"
-
-
-                continue
-
-
-              fi
-
-
-              valid_tar_files+=("$tar_file")
-
-
-            done
-
-
-
-            # ==================================================
-            # 没有有效 TAR
-            # ==================================================
-
-            if [ "${#valid_tar_files[@]}" -eq 0 ]; then
-
-
-              echo "❌ 没有任何有效 TAR。"
-
-
-              echo "没有有效的 Docker TAR。" \
-                > output/package_status.txt
-
-
-            else
-
-
-              echo
-
-              echo "========================================"
-
-              echo "有效 Docker TAR：${#valid_tar_files[@]}"
-
-              echo "========================================"
-
-
-
-              printf '%s\n' "${valid_tar_files[@]}"
-
-
-
-              # =================================================
-              # 创建最终 TAR
-              # =================================================
-
-              echo
-
-              echo "创建最终 docker-images-arm32.tar..."
-
-
-
-              tar \
-
-                -cf \
-
-                output/docker-images-arm32.tar \
-
-                -C raw-images \
-
-                "${valid_tar_files[@]#raw-images/}"
-
-
-
-              FINAL_TAR_SIZE="$(
-                stat -c '%s' output/docker-images-arm32.tar
-              )"
-
-
-
-              echo "最终 TAR 大小：${FINAL_TAR_SIZE} bytes"
-
-
-
-              if [ "$FINAL_TAR_SIZE" -lt 1024 ]; then
-
-
-                echo "❌ 最终 TAR 异常"
-
-
-                rm -f output/docker-images-arm32.tar
-
-
-                exit 1
-
-
-              fi
-
-
-
-              # =================================================
-              # 最终 Zstandard
-              # =================================================
-
-              echo
-
-              echo "开始生成最终 ARM32 TAR.ZST..."
-
-
-
-              zstd \
-
-                -T0 \
-
-                -3 \
-
-                --rm \
-
-                output/docker-images-arm32.tar \
-
-                -o output/docker-images-arm32.tar.zst
-
-
-
-              # =================================================
-              # SHA256
-              # =================================================
-
-              sha256sum \
-
-                output/docker-images-arm32.tar.zst \
-
-                > output/docker-images-arm32.sha256
-
-
-
-              echo "ARM32 Docker 镜像打包成功。" \
-                > output/package_status.txt
-
+              exit 1
 
             fi
+
+
+            # ------------------------------------------------
+            # 最终 Zstandard
+            # ------------------------------------------------
+            echo
+            echo "开始最终 Zstandard 压缩..."
+
+
+            zstd \
+              -T0 \
+              -3 \
+              --rm \
+              output/docker-images-arm32.tar \
+              -o output/docker-images-arm32.tar.zst
+
+
+            # ------------------------------------------------
+            # SHA256
+            # ------------------------------------------------
+            sha256sum \
+              output/docker-images-arm32.tar.zst \
+              > output/docker-images-arm32.sha256
+
+
+            echo "ARM32 Docker 镜像打包成功。" \
+              > output/package_status.txt
 
           fi
 
 
-
-          # ==================================================
-          # 最终统计
-          # ==================================================
-
           echo
-
+          echo "========================================"
+          echo "ARM32 最终文件"
           echo "========================================"
 
-          echo "ARM32 最终统计"
-
-          echo "========================================"
-
-          echo "Matrix 成功：$success_count"
-
-          echo "Matrix 失败：$failed_count"
-
-
-
-          echo
-
-          echo "========== SUCCESS =========="
-
-          cat "$SUCCESS_FILE" || true
-
-
-
-          echo
-
-          echo "========== FAILED =========="
-
-          cat "$FAILED_FILE" || true
-
-
-
-          echo
-
-          echo "========== FINAL FILES =========="
 
           find output \
-
             -maxdepth 1 \
-
             -type f \
-
             -printf '%f  %s bytes\n' \
-
             | sort
 
 
+          echo
+          echo "========== SUCCESS =========="
+
+          cat output/success.txt || true
+
+
+          echo
+          echo "========== FAILED =========="
+
+          cat output/failed.txt || true
+
+
+          echo
+          echo "========================================"
+          echo "Package 完成"
+          echo "========================================"
+
 
       # ======================================================
-      # 4. 最终唯一下载 Artifact
+      # 10. 最终唯一 Artifact
       # ======================================================
-
       - name: Upload Final ARM32 Package
-
         uses: actions/upload-artifact@v7
-
         with:
-
           name: docker-images-arm32
 
           path: |
-
             output/docker-images-arm32.tar.zst
-
             output/docker-images-arm32.sha256
-
             output/success.txt
-
             output/failed.txt
-
             output/package_status.txt
 
-          archive: true
-
           compression-level: 0
-
           retention-days: 7
-
           if-no-files-found: warn
 
 
-
       # ======================================================
-      # 5. 删除 Matrix 临时 Artifact
+      # 11. 删除本次运行的 Matrix 临时 Artifact
       # ======================================================
-
       - name: Delete Temporary Matrix Artifacts
-
         if: always()
-
         shell: bash
-
         env:
-
           GH_TOKEN: ${{ github.token }}
-
           REPO: ${{ github.repository }}
-
-          CURRENT_RUN_ID: ${{ github.run_id }}
-
-
+          RUN_ID: ${{ github.run_id }}
         run: |
-
           set +e
 
+          API="https://api.github.com/repos/${REPO}/actions/runs/${RUN_ID}/artifacts"
+
 
           echo "========================================"
-
           echo "清理 ARM32 Matrix 临时 Artifact"
-
           echo "========================================"
 
 
-
-          ARTIFACTS_JSON="$(
+          response="$(
             curl -sS \
               -H "Accept: application/vnd.github+json" \
               -H "Authorization: Bearer ${GH_TOKEN}" \
               -H "X-GitHub-Api-Version: 2026-03-10" \
-              "https://api.github.com/repos/${REPO}/actions/runs/${CURRENT_RUN_ID}/artifacts?per_page=100"
+              "${API}?per_page=100"
           )"
 
 
-
-          echo "$ARTIFACTS_JSON" |
-
+          echo "$response" |
             jq -r '
-
-              .artifacts[] |
-
-              select(
-
-                (.name | startswith("arm32-image-"))
-
-                or
-
-                (.name | startswith("arm32-result-"))
-
-              ) |
-
-              .id
-
+              .artifacts[]
+              | select(
+                  (.name | startswith("matrix-arm32-"))
+                )
+              | .id
             ' |
-
           while read -r artifact_id; do
-
 
             if [ -z "$artifact_id" ]; then
               continue
             fi
 
 
-
             echo "删除临时 Artifact：$artifact_id"
-
 
 
             HTTP_CODE="$(
@@ -1490,48 +1208,33 @@ jobs:
             )"
 
 
-
             if [ "$HTTP_CODE" = "204" ]; then
 
               echo "✅ 删除成功：$artifact_id"
 
             else
 
-              echo "⚠️ 删除失败：$artifact_id HTTP $HTTP_CODE"
+              echo "⚠️ 删除失败：$artifact_id HTTP ${HTTP_CODE}"
 
             fi
-
 
           done
 
 
-
           echo
-
           echo "========================================"
-
-          echo "临时 Artifact 清理完成"
-
+          echo "ARM32 Matrix 临时 Artifact 清理结束"
           echo "========================================"
 
 
-
       # ======================================================
-      # 6. 清理 Package Runner
+      # 12. 清理 Package Runner
       # ======================================================
-
       - name: Clean Package Workspace
-
         if: always()
-
         shell: bash
-
         run: |
-
-          rm -rf compressed-images
-
+          rm -rf temp-artifacts
+          rm -rf extracted
           rm -rf raw-images
-
-          rm -rf results
-
           rm -rf output
